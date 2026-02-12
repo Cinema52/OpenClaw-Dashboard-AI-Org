@@ -46,6 +46,29 @@ The dashboard parses OpenClaw-style `gatewayUrl`/`auth` style params too, and au
 
 In the dashboard, open Settings (⚙) and use **COPY INSTALL LINK** to generate the exact shareable URL for that environment.
 
+### Bot Runbook (Instant Deploy)
+
+Use this exact handoff for bots:
+
+- Input: `GATEWAY_URL`, `GATEWAY_TOKEN` (optional), `DASHBOARD_HOST` (ex: `https://cinema52.github.io/OpenClaw-Dashboard-AI-Org`).
+- Build:
+
+```bash
+export DASHBOARD_HOST=https://your-host
+export GATEWAY_URL=ws://gateway-host:18789
+export GATEWAY_TOKEN=oc_live_xxx
+export BOOTSTRAP_URL="$(node -e "const host=process.env.DASHBOARD_HOST.replace(/\\/$/,''); const gw=encodeURIComponent(process.env.GATEWAY_URL); const tk=encodeURIComponent(process.env.GATEWAY_TOKEN||''); console.log(host + '/index-2.html?gateway=' + gw + (tk ? '&token=' + tk : ''))")"
+echo $BOOTSTRAP_URL
+```
+
+- Open `BOOTSTRAP_URL`, confirm topbar shows connection status and click nothing else until user opens it.
+- If token is present and clickable is blocked, open page with:
+  - `?gateway=<gateway_url>&token=<token>` (also accepted) and click Settings only if user sees lock/state mismatch.
+- If dashboard still appears unresponsive, run:
+  - `document.querySelectorAll('.modal-overlay.open, #settings-overlay.open').forEach(e => e.classList.remove('open'));`
+
+Expected result: dashboard renders with prefilled gateway config and begins connect attempts automatically.
+
 ---
 
 ## Features

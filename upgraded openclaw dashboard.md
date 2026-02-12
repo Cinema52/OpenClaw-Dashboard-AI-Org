@@ -8,6 +8,18 @@ This document is the operating playbook for future AI agents extending the OpenC
 - Docs: `README.md`, `IMPLEMENTATION_GUIDE.md`
 - Objective: add upgrades, integrations, and plugin-like features without breaking existing behavior
 
+### Bot Deployment Contract
+- Goal: make dashboard instantly usable when a bot receives gateway credentials.
+- Required inputs:
+  - `DASHBOARD_HOST` (public hosted `index-2.html`)
+  - `GATEWAY_URL` (`ws://...` or `wss://...`)
+  - `GATEWAY_TOKEN` (optional, short-lived recommended)
+- Required sequence:
+  1. Build bootstrap URL with `gateway` + `token` query params.
+  2. Open the URL in browser and wait for connection bootstrap toast.
+  3. If page is non-interactive, run: `document.querySelectorAll('.modal-overlay.open, #settings-overlay.open').forEach(e => e.classList.remove('open'));`
+- Success signal: dashboard renders with prefilled gateway values and auto-connect attempts begin.
+
 ## Mental Model (current architecture)
 - UI + state + persistence are all in `index-2.html`.
 - Core state lives in the global `state` object.
