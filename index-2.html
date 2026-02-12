@@ -2813,14 +2813,38 @@ function _stripBootstrapFromAddress(config) {
   } catch(e) {}
 }
 
+function _normalizeGatewayUrl(raw) {
+  const rawValue = _sanitizeBootstrapValue(raw);
+  if (!rawValue) return '';
+
+  if (/^wss?:\/\/[^/]+/i.test(rawValue)) return rawValue;
+  if (/^https?:\/\//i.test(rawValue)) {
+    return rawValue.replace(/^https?:\/\//i, rawValue.startsWith('https:') ? 'wss://' : 'ws://');
+  }
+  if (rawValue.includes('://')) return '';
+  return `ws://${rawValue.replace(/^\/+/, '')}`;
+}
+
+function _isGatewayUrl(value) {
+  try {
+    const parsed = new URL(_normalizeGatewayUrl(value));
+    return parsed.protocol === 'ws:' || parsed.protocol === 'wss:';
+  } catch {
+    return false;
+  }
+}
+
 const __agentInstallConfig = _getAgentInstallConfig();
 if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
   _stripBootstrapFromAddress(__agentInstallConfig);
 }
 
 if (__agentInstallConfig.gatewayUrl) {
-  state.gatewayUrl = __agentInstallConfig.gatewayUrl;
-  try { localStorage.setItem('oc_gw_url', state.gatewayUrl); } catch(e) {}
+  const normalizedGateway = _normalizeGatewayUrl(__agentInstallConfig.gatewayUrl);
+  if (normalizedGateway) {
+    state.gatewayUrl = normalizedGateway;
+    try { localStorage.setItem('oc_gw_url', state.gatewayUrl); } catch(e) {}
+  }
 }
 if (__agentInstallConfig.hasToken) {
   state.authToken = __agentInstallConfig.authToken;
@@ -3182,7 +3206,12 @@ const _storage = {
   // Debounced save — coalesces rapid writes
   queueSave() {
     this._dirty = true;
-    _updateSaveIndicator('saving');
+    const now = Date.now();
+    const threshold = 5000;
+    if (!this._nextSaveUiAt || now >= this._nextSaveUiAt) {
+      _updateSaveIndicator('saving');
+      this._nextSaveUiAt = now + threshold;
+    }
     if (this._saveTimer) clearTimeout(this._saveTimer);
     this._saveTimer = setTimeout(() => this.persistFullState(), 1500);
   },
@@ -4108,14 +4137,29 @@ $('#add-agent-btn')?.addEventListener('click', () => _openAgentModal());
 // ── GATEWAY WEBSOCKET ───────────────────────────────
 let _reconnectAttempt = 0;
 function connectGateway() {
+  const normalizedGatewayUrl = _normalizeGatewayUrl(state.gatewayUrl);
+  if (!_isGatewayUrl(normalizedGatewayUrl)) {
+    const el = $('#conn-status');
+    if (el) {
+      el.className = 'disconnected';
+      el.title = 'Gateway: invalid URL';
+    }
+    console.warn('[CommandCenter] Invalid gateway URL:', state.gatewayUrl);
+    return;
+  }
+  if (state.gatewayUrl !== normalizedGatewayUrl) {
+    state.gatewayUrl = normalizedGatewayUrl;
+    _safeSave('oc_gw_url', state.gatewayUrl);
+  }
+
   if (state.ws) { state.ws.close(); state.ws = null; }
   const el = $('#conn-status');
   el.className = 'connecting'; el.title = 'Connecting...';
 
   try {
     const url = state.authToken
-      ? `${state.gatewayUrl}?token=${encodeURIComponent(state.authToken)}`
-      : state.gatewayUrl;
+      ? `${normalizedGatewayUrl}?token=${encodeURIComponent(state.authToken)}`
+      : normalizedGatewayUrl;
     const ws = new WebSocket(url);
     state.ws = ws;
 
@@ -9041,7 +9085,13 @@ if ((__agentInstallConfig?.source || __agentInstallConfig?.gatewayUrl || __agent
 }
 
 if (state.gatewayUrl) {
-  setTimeout(connectGateway, 500);
+  state.gatewayUrl = _normalizeGatewayUrl(state.gatewayUrl);
+  if (_isGatewayUrl(state.gatewayUrl)) {
+    setTimeout(() => { if (!state.connected) connectGateway(); }, 500);
+  } else {
+    console.warn('[Boot] Gateway URL is not valid for websocket auto-connect:', state.gatewayUrl);
+    _updateSaveIndicator('recovering');
+  }
 }
 
 // Periodically refresh
