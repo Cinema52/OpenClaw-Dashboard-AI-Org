@@ -2723,13 +2723,24 @@ function _parseGatewayCandidate(raw, fallbackToken = '') {
 }
 
 function _getAgentInstallConfig() {
+  const tokenKeys = [
+    'token', 'auth', 'auth_token', 'auth-token', 'gw_token', 'gateway_token',
+    'agent_token', 'agent-token', 'openid_token', 'access_token', 'authorization'
+  ];
+  const gatewayKeys = [
+    'gateway', 'gw', 'ws', 'url', 'gateway_url', 'gateway-url', 'gatewayUrl', 'gateway-url',
+    'gw_url', 'gw-url',
+    'agent', 'agent_url', 'agent-url', 'agent-link', 'agent-link-url', 'agentlink',
+    'openclaw', 'openclaw-url', 'openclaw_url', 'openclaw_gateway', 'openclaw_gateway_url',
+    'link'
+  ];
   const query = new URLSearchParams(location.search);
   const hash = (location.hash || '').replace(/^#/, '');
   const hashParams = hash.includes('=') ? new URLSearchParams(hash) : null;
   const hashRawOnly = (hash && !hash.includes('=')) ? _decodeMaybe(hash) : '';
 
-  const tokenParam = _readBootstrapParam(BOOTSTRAP_TOKEN_KEYS, query, hashParams);
-  const gatewayParam = _readBootstrapParam(BOOTSTRAP_GATEWAY_KEYS, query, hashParams);
+  const tokenParam = _readBootstrapParam(tokenKeys, query, hashParams);
+  const gatewayParam = _readBootstrapParam(gatewayKeys, query, hashParams);
   const agentParam = _readBootstrapParam(['agent', 'openclaw_agent', 'agent-link', 'agent-link-url'], query, hashParams);
 
   if (agentParam.has) {
