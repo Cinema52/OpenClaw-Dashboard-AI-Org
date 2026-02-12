@@ -2805,6 +2805,12 @@ function _stripBootstrapFromAddress(config) {
   } catch(e) {}
 }
 
+function _closeBlockingOverlays() {
+  document.querySelectorAll('.modal-overlay.open, #settings-overlay.open').forEach(el => {
+    el.classList.remove('open');
+  });
+}
+
 const __agentInstallConfig = _getAgentInstallConfig();
 if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
   _stripBootstrapFromAddress(__agentInstallConfig);
@@ -8944,6 +8950,7 @@ function saveAvatar() {
 
 // ── BOOT ────────────────────────────────────────────
 initAvatars();
+_closeBlockingOverlays();
 renderAll();
 dripChatter();
 
