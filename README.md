@@ -66,6 +66,8 @@ echo $BOOTSTRAP_URL
   - `?gateway=<gateway_url>&token=<token>` (also accepted) and click Settings only if user sees lock/state mismatch.
 - If dashboard still appears unresponsive, run:
   - `document.querySelectorAll('.modal-overlay.open, #settings-overlay.open').forEach(e => e.classList.remove('open'));`
+- If unresponsive persists after that, run:
+  - `document.querySelectorAll('.modal-overlay[data-oc-generated], .modal-overlay.open, #settings-overlay.open').forEach(e => e.remove ? e.remove() : e.classList.remove('open'));`
 
 Expected result: dashboard renders with prefilled gateway config and begins connect attempts automatically.
 
