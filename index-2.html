@@ -2527,6 +2527,11 @@ const DEFAULT_AGENTS = [
   { id: "forge", name: "FORGE", role: "Development", color: "#bf5af2", model: "claude-sonnet-4-5-20250929", admin: true, skills: ["Code Review","Architecture","DevOps","Security Audits"], personality: "Technical architect and security-minded builder" },
 ];
 
+const __agentInstallConfig = _getAgentInstallConfig();
+if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
+  _stripBootstrapFromAddress(__agentInstallConfig);
+}
+
 let state = {
   gatewayUrl: __agentInstallConfig.gatewayUrl || localStorage.getItem('oc_gw_url') || 'ws://127.0.0.1:18789',
   authToken: __agentInstallConfig.hasToken ? __agentInstallConfig.authToken : (localStorage.getItem('oc_gw_token') || ''),
@@ -2807,6 +2812,7 @@ function _stripBootstrapFromAddress(config) {
 }
 
 function _closeBlockingOverlays() {
+  // Remove explicit modal overlays first
   document.querySelectorAll('.modal-overlay.open, #settings-overlay.open').forEach(el => {
     el.classList.remove('open');
     el.style.pointerEvents = 'none';
@@ -2817,7 +2823,7 @@ function _closeBlockingOverlays() {
     if (el.isConnected) el.remove();
   });
 
-  // Explicitly clear any lingering inline display state on closed modals
+  // Explicitly clear lingering inline display/pointer state on closed modals
   document.querySelectorAll('.modal-overlay, #settings-overlay').forEach(el => {
     if (!el.classList.contains('open')) {
       el.style.display = '';
@@ -2826,12 +2832,41 @@ function _closeBlockingOverlays() {
       }
     }
   });
+
+  // Sweep for any full-screen element with active hit-testing that can block all clicks
+  const allowlist = new Set([document.body, document.documentElement, $('#app'), $('#sidebar'), $('#main'), $('#content'), $('#toast-container')]);
+  const viewportW = window.innerWidth || document.documentElement.clientWidth || 1024;
+  const viewportH = window.innerHeight || document.documentElement.clientHeight || 768;
+  const isLikelyBlocker = el => {
+    if (!el || !(el instanceof Element) || allowlist.has(el)) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < viewportW * 0.95 || rect.height < viewportH * 0.95) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    if (cs.pointerEvents === 'none') return false;
+    if (el.id === 'app' || el.id === 'sidebar' || el.id === 'main' || el.id === 'content' || el.id === 'toast-container') return false;
+    if (['#fff', 'transparent', 'rgba(0, 0, 0, 0)'].includes(cs.backgroundColor) && !el.classList.contains('modal-overlay')) return false;
+    if (el.closest('#app')) return false;
+    if (!['fixed', 'absolute'].includes(cs.position)) return false;
+    const z = Number.parseInt(cs.zIndex || '0', 10) || 0;
+    return z > 50;
+  };
+
+  document.querySelectorAll('body *').forEach(el => {
+    if (isLikelyBlocker(el)) {
+      el.style.pointerEvents = 'none';
+      if (el.classList.contains('modal-overlay') || el.id === 'settings-overlay' || (getComputedStyle(el).zIndex && Number.parseInt(getComputedStyle(el).zIndex, 10) > 500)) {
+        if (el.isConnected) el.remove();
+      }
+      // Fallback safety: disable hit testing only for anonymous blockers
+      else {
+        el.style.display = 'none';
+      }
+    }
+  });
 }
 
-const __agentInstallConfig = _getAgentInstallConfig();
-if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
-  _stripBootstrapFromAddress(__agentInstallConfig);
-}
+window.__ocUnblockUI = _closeBlockingOverlays;
 
 const typeColors = { meeting:"#0a84ff", deploy:"#bf5af2", research:"#ff9f0a", launch:"#34c759", review:"#ffd60a", delivery:"#34c759" };
 const priColors = { high:"#ff453a", medium:"#ffd60a", low:"var(--text-muted)" };
