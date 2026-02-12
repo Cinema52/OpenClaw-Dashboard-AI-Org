@@ -2527,14 +2527,12 @@ const DEFAULT_AGENTS = [
   { id: "forge", name: "FORGE", role: "Development", color: "#bf5af2", model: "claude-sonnet-4-5-20250929", admin: true, skills: ["Code Review","Architecture","DevOps","Security Audits"], personality: "Technical architect and security-minded builder" },
 ];
 
-const __agentInstallConfig = _getAgentInstallConfig();
-if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
-  _stripBootstrapFromAddress(__agentInstallConfig);
-}
+const __installGatewayFallback = localStorage.getItem('oc_gw_url') || 'ws://127.0.0.1:18789';
+const __installTokenFallback = localStorage.getItem('oc_gw_token') || '';
 
 let state = {
-  gatewayUrl: __agentInstallConfig.gatewayUrl || localStorage.getItem('oc_gw_url') || 'ws://127.0.0.1:18789',
-  authToken: __agentInstallConfig.hasToken ? __agentInstallConfig.authToken : (localStorage.getItem('oc_gw_token') || ''),
+  gatewayUrl: __installGatewayFallback,
+  authToken: __installTokenFallback,
   gatewayModels: JSON.parse(localStorage.getItem('oc_gatewayModels') || 'null') || [],
   agents: JSON.parse(localStorage.getItem('oc_agents') || 'null') || DEFAULT_AGENTS,
   ws: null,
@@ -2597,13 +2595,6 @@ let state = {
     history: [],  // past meetings
   },
 };
-
-if (__agentInstallConfig.gatewayUrl) {
-  try { localStorage.setItem('oc_gw_url', state.gatewayUrl); } catch(e) {}
-}
-if (__agentInstallConfig.hasToken) {
-  try { localStorage.setItem('oc_gw_token', state.authToken); } catch(e) {}
-}
 
 // Migrate agents: add model/admin fields if missing
 state.agents.forEach(a => {
@@ -2809,6 +2800,20 @@ function _stripBootstrapFromAddress(config) {
 
     if (changed) history.replaceState({}, '', url.toString());
   } catch(e) {}
+}
+
+const __agentInstallConfig = _getAgentInstallConfig();
+if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
+  _stripBootstrapFromAddress(__agentInstallConfig);
+}
+
+if (__agentInstallConfig.gatewayUrl) {
+  state.gatewayUrl = __agentInstallConfig.gatewayUrl;
+  try { localStorage.setItem('oc_gw_url', state.gatewayUrl); } catch(e) {}
+}
+if (__agentInstallConfig.hasToken) {
+  state.authToken = __agentInstallConfig.authToken;
+  try { localStorage.setItem('oc_gw_token', state.authToken); } catch(e) {}
 }
 
 function _closeBlockingOverlays() {
