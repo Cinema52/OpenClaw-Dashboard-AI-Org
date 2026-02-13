@@ -2533,6 +2533,7 @@ const __installTokenFallback = localStorage.getItem('oc_gw_token') || '';
 let state = {
   gatewayUrl: __installGatewayFallback,
   authToken: __installTokenFallback,
+  authPassword: '',
   gatewayModels: JSON.parse(localStorage.getItem('oc_gatewayModels') || 'null') || [],
   agents: JSON.parse(localStorage.getItem('oc_agents') || 'null') || DEFAULT_AGENTS,
   ws: null,
@@ -2645,6 +2646,11 @@ function _isAllowedGatewayCandidate(raw) {
   return /^[A-Za-z0-9.\-_:/?&=%+~#@!,()'"]+$/.test(raw);
 }
 
+function _isAllowedGatewayToken(raw) {
+  if (!raw) return false;
+  return /^[A-Za-z0-9._~+/=-]+$/.test(raw);
+}
+
 function _decodeMaybe(v) {
   if (v == null) return '';
   try { return decodeURIComponent(String(v)); } catch(e) { return String(v); }
@@ -2669,7 +2675,9 @@ function _parseGatewayCandidate(raw, fallbackToken = '') {
   if (!_isAllowedGatewayCandidate(value)) return { gatewayUrl: '', authToken: '', hasGateway: false, hasToken: false, source: 'candidate' };
 
   const defaultToken = _sanitizeBootstrapToken(fallbackToken);
-  if (!_isAllowedGatewayCandidate(defaultToken)) return { gatewayUrl: '', authToken: '', hasGateway: false, hasToken: false, source: 'candidate' };
+  if (defaultToken && !_isAllowedGatewayToken(defaultToken)) {
+    return { gatewayUrl: '', authToken: '', hasGateway: false, hasToken: false, source: 'candidate' };
+  }
 
   const normalized = value
     .replace(/^openclaw\+?wss?:\/\//i, 'wss://')
@@ -2832,6 +2840,981 @@ function _isGatewayUrl(value) {
   } catch {
     return false;
   }
+}
+
+const OPENCLAW_PROTOCOL_MIN = 3;
+const OPENCLAW_PROTOCOL_MAX = 3;
+const OPENCLAW_CONNECT_TIMEOUT_MS = 8000;
+const OPENCLAW_CONNECT_SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.pairing'];
+const OPENCLAW_CONNECT_SCOPES_STRICT = ['operator.read', 'operator.write'];
+const OPENCLAW_EVENT_TYPES = new Set([
+  'agent',
+  'agent_comms',
+  'chat',
+  'chat.message',
+  'chat.stream',
+  'canvas_eval',
+  'connect.challenge',
+  'connect.challenge_ack',
+  'connected',
+  'hello',
+  'hello-ok',
+  'hello_ok',
+  'model',
+  'model.list',
+  'message',
+  'meeting_message',
+  'models.list',
+  'models',
+  'presence',
+  'presence_update',
+  'routing_ack',
+  'state.ack',
+  'state_ack',
+  'state.conflict',
+  'state_conflict',
+  'system-presence',
+  'state.restore',
+  'state_restore',
+  'vault_request',
+  'vault.request',
+]);
+
+let _gatewayProtocolPreference = 'auto';
+let _gatewayProtocolRuntimeMode = 'auto';
+let _openclawReqSeq = 0;
+let _openclawReqs = new Map();
+let _openclawConnectSession = 0;
+let _openclawHelloAt = 0;
+let _openclawFallbackScheduled = false;
+let _gatewayNegotiationTimer = null;
+let _openclawConnectChallengeCount = 0;
+let _openclawConnectChallenge = null;
+let _openclawPendingHelloApply = null;
+const OPENCLAW_DEVICE_ID_KEY = 'oc_openclaw_device_id';
+const OPENCLAW_BOOTSTRAP_LOG_LIMIT = 60;
+const _openclawBootstrapLog = [];
+
+function _recordOpenclawBootstrap(entry) {
+  try {
+    _openclawBootstrapLog.push({
+      ts: Date.now(),
+      ...entry,
+    });
+    if (_openclawBootstrapLog.length > OPENCLAW_BOOTSTRAP_LOG_LIMIT) {
+      _openclawBootstrapLog.splice(0, _openclawBootstrapLog.length - OPENCLAW_BOOTSTRAP_LOG_LIMIT);
+    }
+  } catch(e) {}
+}
+
+_gatewayProtocolPreference = _readGatewayProtocolPreference();
+_gatewayProtocolRuntimeMode = _gatewayProtocolPreference;
+
+function _readGatewayProtocolPreference() {
+  try {
+    const stored = localStorage.getItem('oc_gateway_protocol_mode');
+    if (stored === 'auto' || stored === 'legacy' || stored === 'openclaw') return stored;
+  } catch(e) {}
+  return 'auto';
+}
+
+function _setGatewayProtocolMode(mode) {
+  const normalized = mode === 'legacy' || mode === 'openclaw' || mode === 'auto' ? mode : 'auto';
+  _gatewayProtocolPreference = normalized;
+  _gatewayProtocolRuntimeMode = normalized;
+  try { localStorage.setItem('oc_gateway_protocol_mode', normalized); } catch(e) {}
+}
+
+function _clearOpenclawRequests(reason = 'disconnect') {
+  _openclawReqs.forEach((entry) => {
+    clearTimeout(entry.timer);
+    if (entry.reject) entry.reject(new Error(`OpenClaw request canceled: ${reason}`));
+  });
+  _openclawReqs.clear();
+}
+
+function _nextOpenclawReqId() {
+  _openclawReqSeq += 1;
+  return `cc-${Date.now().toString(36)}-${_openclawReqSeq}`;
+}
+
+function _getOpenclawClientInstanceId() {
+  const storageKey = 'oc_openclaw_instance_id';
+  try {
+    const existing = localStorage.getItem(storageKey);
+    if (existing && existing.trim()) return existing.trim();
+    const generated =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? `web-${crypto.randomUUID()}`
+        : `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    localStorage.setItem(storageKey, generated);
+    return generated;
+  } catch (e) {
+    return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+}
+
+function _getOpenclawDeviceIdentity(challenge = null) {
+  let deviceId = '';
+  try {
+    deviceId = localStorage.getItem(OPENCLAW_DEVICE_ID_KEY) || '';
+  } catch(e) {}
+
+  if (!deviceId) {
+    deviceId = typeof crypto !== 'undefined' && crypto.randomUUID
+      ? `web-${crypto.randomUUID()}`
+      : `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    try { localStorage.setItem(OPENCLAW_DEVICE_ID_KEY, deviceId); } catch(e) {}
+  }
+
+  const identity = { id: deviceId };
+  const nonce = challenge && typeof challenge === 'object' ? _sanitizeBootstrapValue(challenge.nonce || challenge.nonceData || challenge.nonceStr) : '';
+  const ts = challenge && typeof challenge === 'object' ? Number(challenge.ts || challenge.signedAt || challenge.timestamp) : NaN;
+  const challengeTs = Number.isFinite(ts) ? ts : null;
+
+  if (nonce) identity.nonce = nonce;
+  if (challengeTs) identity.signedAt = challengeTs;
+  return identity;
+}
+
+function _sendOpenclawRequest(method, params = {}, timeoutMs = 10000) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error('Gateway not connected'));
+  }
+  const reqId = _nextOpenclawReqId();
+  const payload = { type: 'req', id: reqId, method, params };
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      _openclawReqs.delete(reqId);
+      reject(new Error(`OpenClaw ${method} request timed out`));
+    }, timeoutMs);
+
+    _openclawReqs.set(reqId, {
+      method,
+      resolve,
+      reject,
+      timer,
+    });
+
+    try {
+      state.ws.send(JSON.stringify(payload));
+    } catch(e) {
+      clearTimeout(timer);
+      _openclawReqs.delete(reqId);
+      reject(e);
+    }
+  });
+}
+
+function _extractOpenclawPayload(payload) {
+  return payload?.payload ?? payload?.result ?? payload?.data ?? payload;
+}
+
+function _extractOpenclawList(payload, keys) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  for (const key of keys) {
+    const v = payload[key];
+    if (Array.isArray(v)) return v;
+  }
+  const nested = [payload.payload, payload.data, payload.result];
+  for (const item of nested) {
+    if (!item || typeof item !== 'object') continue;
+    for (const key of keys) {
+      const v = item[key];
+      if (Array.isArray(v)) return v;
+    }
+  }
+  return [];
+}
+
+function _normalizeOpenclawEventName(raw) {
+  const event = String(raw || '').toLowerCase();
+  if (!event) return '';
+  const underscore = event.replace(/-/g, '_');
+  if (OPENCLAW_EVENT_TYPES.has(underscore)) return underscore;
+  const dotted = event.replace(/_/g, '.');
+  if (OPENCLAW_EVENT_TYPES.has(dotted)) return dotted;
+  return underscore;
+}
+
+function _isOpenclawHandshakeComplete(payload) {
+  if (!payload || payload.ok === false) return false;
+  const body = _extractOpenclawPayload(payload);
+  if (typeof body === 'string') {
+    return /hello(-|_)?ok|connected|ok/i.test(body);
+  }
+  if (!body || typeof body !== 'object') return true;
+  if (typeof body.type === 'string') {
+    const value = body.type.toLowerCase();
+    if (value === 'hello-ok' || value === 'hello_ok' || value === 'connected') return true;
+  }
+  return !!(body.ok || body.sessionId || body.auth || body.deviceToken || body.protocolVersion || body.role || body.state);
+}
+
+function _syncGatewayStateConflict(msg) {
+  if (!msg) return;
+  const gwTs = msg.savedAt || 0;
+  const localTs = _storage._lastSaveTs || 0;
+  console.warn(`[Sync] State conflict — gateway: ${new Date(gwTs).toLocaleString()}, local: ${new Date(localTs).toLocaleString()}`);
+  const useGateway = confirm(
+    `State conflict detected!\n\n` +
+    `Gateway copy: ${new Date(gwTs).toLocaleString()}\n` +
+    `Your local copy: ${new Date(localTs).toLocaleString()}\n\n` +
+    `Use the gateway version? (Cancel keeps your local version)`
+  );
+  if (useGateway && msg.state) {
+    _storage._applySnapshot(msg.state);
+    _storage.createBackup('conflict-resolve');
+    _storage.persistFullState();
+    renderAll();
+    _showToast({ text: 'Resolved — using gateway state', level: 'success', ts: ts() });
+  } else {
+    const snap = _storage._getSerializableState();
+    snap._savedAt = _storage._lastSaveTs;
+    _storage._syncToGateway(snap);
+    _showToast({ text: 'Resolved — pushed local state to gateway', level: 'info', ts: ts() });
+  }
+}
+
+function _handleOpenclawResponse(msg) {
+  if (msg?.type !== 'res' || !msg?.id) return false;
+  const req = _openclawReqs.get(msg.id);
+  if (!req) return false;
+
+  clearTimeout(req.timer);
+  _openclawReqs.delete(msg.id);
+  if (msg.ok === false) {
+    const reason = _extractOpenclawPayload(msg)?.error || msg.error || 'OpenClaw request failed';
+    const message = typeof reason === 'string' ? reason : reason?.message || 'OpenClaw request failed';
+    req.reject(new Error(message));
+    return true;
+  }
+  req.resolve(_extractOpenclawPayload(msg));
+  return true;
+}
+
+function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null) {
+  const challengeData = _extractOpenclawPayload(challenge || {});
+  const auth = challengeData?.auth || {};
+  const authPayload = {
+    ...auth,
+    ...(state.authToken ? { token: state.authToken } : {}),
+    ...(state.authPassword ? { password: state.authPassword } : {}),
+  };
+  const payload = {
+    minProtocol: OPENCLAW_PROTOCOL_MIN,
+    maxProtocol: OPENCLAW_PROTOCOL_MAX,
+    client: {
+      id: 'openclaw-control-ui',
+      version: '1.0.0',
+      platform: 'web',
+      mode: 'ui',
+    },
+    role: 'operator',
+    scopes,
+    locale: navigator.language || 'en-US',
+  };
+  payload.device = _getOpenclawDeviceIdentity(challengeData);
+
+  if (Object.keys(authPayload).length) payload.auth = authPayload;
+  if (challengeData?.nonce) payload.device.nonce = challengeData.nonce;
+  if (challengeData?.nonceStr) payload.device.nonce = payload.device.nonce || _sanitizeBootstrapToken(challengeData.nonceStr);
+  if (challengeData?.signedAt || challengeData?.ts) payload.device.signedAt = Number(challengeData.signedAt || challengeData.ts);
+
+  return payload;
+}
+
+function _normalizeOpenclawAgentsPayload(payload) {
+  const input = _extractOpenclawList(payload, ['agents', 'nodes', 'agentList', 'nodeList', 'items']);
+  if (!Array.isArray(input)) return [];
+  const mapped = [];
+  input.forEach(agent => {
+    if (typeof agent === 'string' && agent.trim()) {
+      mapped.push({
+        id: agent.trim(),
+        name: agent.trim(),
+        role: 'Operator',
+        model: 'claude-sonnet-4-5-20250929',
+        color: '#34c759',
+        admin: true,
+        skills: [],
+        personality: '',
+      });
+      return;
+    }
+    if (!agent || typeof agent !== 'object') return;
+    const id = agent.id || agent.agentId || agent.nodeId;
+    if (!id) return;
+    const normalized = {
+      id: String(id),
+      name: agent.name || agent.nodeId || String(id),
+      role: agent.role || agent.mode || 'Operator',
+      model: agent.model || agent.modelId || agent.defaultModel || 'claude-sonnet-4-5-20250929',
+      color: agent.color || '#34c759',
+      admin: agent.admin === false ? false : true,
+      skills: Array.isArray(agent.skills) ? agent.skills : [],
+      personality: agent.personality || '',
+    };
+    mapped.push(normalized);
+  });
+  return mapped;
+}
+
+function _normalizeOpenclawModelsPayload(payload) {
+  let input = _extractOpenclawList(payload, ['models', 'modelList', 'model_list', 'items', 'availableModels', 'list']);
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter(item => item && typeof item === 'object')
+    .map(item => ({
+      id: item.id || item.model || item.name,
+      name: item.name || item.id || item.model || item.label,
+      provider: item.provider || item.source || item.vendor || 'Gateway',
+      tier: item.tier || item.quality || 'available',
+      size: item.size || null,
+    }))
+    .concat(
+      input.filter(item => typeof item === 'string').map((item) => ({
+        id: item,
+        name: item,
+        provider: 'Gateway',
+        tier: 'available',
+        size: null,
+      }))
+    )
+    .filter(m => m.id && m.name);
+}
+
+function _startOpenclawBootstrap() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  _clearOpenclawRequests('bootstrap-reset');
+  _openclawHelloAt = 0;
+  const bootstrapSession = ++_openclawConnectSession;
+  const el = $('#conn-status');
+  _openclawConnectChallengeCount = 0;
+
+  if (_gatewayNegotiationTimer) {
+    clearTimeout(_gatewayNegotiationTimer);
+    _gatewayNegotiationTimer = null;
+  }
+
+  const connectTimeoutMs = Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000);
+  const scopeAttempts = [OPENCLAW_CONNECT_SCOPES, OPENCLAW_CONNECT_SCOPES_STRICT];
+
+  const applyOpenclawHello = (payload = {}) => {
+    if (_openclawConnectSession !== bootstrapSession || _openclawHelloAt) return;
+
+    const body = _extractOpenclawPayload(payload);
+    if (!_isOpenclawHandshakeComplete(payload)) {
+      console.warn('[CommandCenter] OpenClaw connect did not return hello-ok:', payload);
+      throw new Error('connect response invalid');
+    }
+
+    _openclawHelloAt = Date.now();
+    const deviceToken = body?.auth?.deviceToken || body?.deviceToken || payload?.auth?.deviceToken || payload?.token;
+    if (deviceToken) {
+      state.authToken = deviceToken;
+      try { localStorage.setItem('oc_gw_token', deviceToken); } catch(e) {}
+    }
+
+    const snapshot = body?.snapshot || payload?.snapshot || body?.state || payload?.state || {};
+    const mappedFromSnapshot = _normalizeOpenclawModelsPayload(snapshot?.models || snapshot?.modelList || snapshot?.model_list || []);
+    if (mappedFromSnapshot.length) {
+      state.gatewayModels = mappedFromSnapshot;
+      _safeSave('oc_gatewayModels', state.gatewayModels);
+    }
+
+    _gatewayProtocolRuntimeMode = 'openclaw';
+    _setGatewayProtocolMode('openclaw');
+    if (_gatewayNegotiationTimer) {
+      clearTimeout(_gatewayNegotiationTimer);
+      _gatewayNegotiationTimer = null;
+    }
+
+    if (el) { el.className = 'connected'; el.title = 'Gateway: connected (openclaw)'; }
+    state.connected = true;
+    _reconnectAttempt = 0;
+    console.log('[CommandCenter] OpenClaw handshake OK', payload);
+
+    const normalizeAgentsFromResponse = (data) => {
+      const merged = _normalizeOpenclawAgentsPayload(data);
+      if (!merged.length) return;
+      state.agents = merged;
+      state.agents.forEach(a => { state.chatMessages[a.id] = state.chatMessages[a.id] || []; });
+      renderAll();
+      _safeSave('oc_agents', state.agents);
+      state.activeChat = state.agents[0]?.id || state.activeChat;
+    };
+    _sendOpenclawRequest('agents.list')
+      .then((data) => {
+        normalizeAgentsFromResponse(data);
+      })
+      .catch(() => _sendOpenclawRequest('agent.list').then((data) => {
+        normalizeAgentsFromResponse(data);
+      }))
+      .catch((err) => {
+        console.warn('[CommandCenter] agents list fetch failed:', err.message);
+      });
+
+    const normalizeModelsFromResponse = (payload) => {
+      const mapped = _normalizeOpenclawModelsPayload(payload);
+      if (!mapped.length) return;
+      state.gatewayModels = mapped;
+      _safeSave('oc_gatewayModels', state.gatewayModels);
+      _showToast({ text: `Loaded ${mapped.length} models from OpenClaw gateway`, level:'success', ts: ts() });
+    };
+    _sendOpenclawRequest('models.list')
+      .then((data) => {
+        normalizeModelsFromResponse(data);
+      })
+      .catch(() => _sendOpenclawRequest('model.list'))
+      .then((data) => {
+        if (data) normalizeModelsFromResponse(data);
+      })
+      .catch(() => _sendOpenclawRequest('models'))
+      .then((data) => {
+        if (data) normalizeModelsFromResponse(data);
+      })
+      .catch((err) => {
+        console.warn('[CommandCenter] models load failed:', err.message);
+      });
+
+    _sendOpenclawRequest('system-presence').then((data) => {
+      const list = data?.presence || data?.nodes || [];
+      if (Array.isArray(list)) {
+        list.forEach(item => {
+          if (item && item.agentId && item.status) {
+            state.agentStatus[item.agentId] = item.status;
+          }
+        });
+        renderAgentPills();
+        renderOrgChart();
+      }
+    }).catch(() => {});
+
+    // Pull latest chat history for each agent in the OpenClaw session model
+    const sessionKey = state.chatSessionKey || 'main';
+    Promise.all(state.agents.map((agent) => _sendOpenclawRequest('chat.history', {
+      agentId: agent.id,
+      sessionKey,
+      limit: 200,
+    }).then((payload = {}) => {
+      const records = _normalizeOpenclawChatHistory(payload, agent.id);
+      if (records.length) {
+        state.chatMessages[agent.id] = _mergeOpenclawChatHistory(agent.id, records);
+      }
+    }).catch(() => {}))).finally(() => {
+      _trimChat();
+      _saveChatMessages();
+      renderChat();
+    });
+
+    _syncAllRouting('reconnect');
+    _storage.requestStateFromGateway();
+    _syncVaultToGateway();
+  };
+
+  _openclawPendingHelloApply = applyOpenclawHello;
+
+  const sendConnect = (scopes, challengePayload = null) =>
+    _sendOpenclawRequest('connect', _buildOpenclawConnectPayload(scopes, challengePayload), connectTimeoutMs).then((payload) => {
+      applyOpenclawHello(payload);
+    });
+
+  const attemptConnect = (attempt = 0) =>
+    sendConnect(scopeAttempts[Math.min(attempt, scopeAttempts.length - 1)])
+    .catch((err) => {
+        if (_openclawConnectSession !== bootstrapSession) return;
+        if (attempt + 1 < scopeAttempts.length) {
+          console.warn('[CommandCenter] OpenClaw connect retry with reduced scopes.', err.message);
+          return attemptConnect(attempt + 1);
+        }
+        throw err;
+      });
+
+  attemptConnect()
+    .then(() => {
+      if (_openclawConnectSession !== bootstrapSession) return;
+      if (!_openclawHelloAt) {
+        throw new Error('connect response invalid');
+      }
+    })
+    .catch((err) => {
+      if (_openclawConnectSession !== bootstrapSession) return;
+
+      console.warn('[CommandCenter] OpenClaw connect failed:', err.message);
+      state.connected = false;
+      _openclawHelloAt = 0;
+      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled;
+      if (_openclawConnectSession === bootstrapSession) {
+        _openclawPendingHelloApply = null;
+      }
+
+      if (fallback) {
+        _openclawFallbackScheduled = true;
+        _gatewayProtocolRuntimeMode = 'legacy';
+        console.warn('[CommandCenter] Falling back to legacy gateway protocol.');
+        setTimeout(() => {
+          _openclawFallbackScheduled = false;
+          if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.close(4001, 'legacy-fallback');
+          _setGatewayProtocolMode('legacy');
+          connectGateway();
+        }, 250);
+      } else {
+        if (el) { el.className = 'disconnected'; el.title = `Gateway: connect failed (${err.message})`; }
+      }
+    })
+    .finally(() => {
+      if (_openclawConnectSession === bootstrapSession) {
+        _openclawPendingHelloApply = null;
+      }
+    });
+}
+
+function _startLegacyBootstrap() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  _gatewayProtocolRuntimeMode = 'legacy';
+  if (_gatewayProtocolPreference === 'auto') {
+    _setGatewayProtocolMode('legacy');
+  }
+  state.connected = true;
+  _reconnectAttempt = 0;
+  const el = $('#conn-status');
+  if (el) { el.className = 'connected'; el.title = 'Gateway: connected'; }
+  try {
+    state.ws.send(JSON.stringify({ type: 'subscribe', channels: ['sessions','presence','config'] }));
+    state.ws.send(JSON.stringify({ type: 'get_models' }));
+    _storage.requestStateFromGateway();
+    _syncAllRouting('reconnect');
+    _syncVaultToGateway();
+  } catch(e) {
+    console.warn('[CommandCenter] Legacy bootstrap failed:', e.message);
+    state.connected = false;
+    if (el) { el.className = 'disconnected'; el.title = 'Gateway: legacy bootstrap failed'; }
+  }
+}
+
+function _isOpenclawConnectedMode() {
+  return _gatewayProtocolRuntimeMode === 'openclaw';
+}
+
+function _isGatewayConnected() {
+  return !!state.ws && state.ws.readyState === WebSocket.OPEN;
+}
+
+function _sendGatewayPayload(payload) {
+  if (!_isGatewayConnected()) return false;
+  try {
+    state.ws.send(JSON.stringify(payload));
+    return true;
+  } catch(e) {
+    console.warn('[CommandCenter] Gateway send failed:', e.message);
+    return false;
+  }
+}
+
+function _chatSessionKey(agentId) {
+  const prefix = state.chatSessionPrefix || 'agent';
+  if (!agentId) return 'main';
+  return `${prefix}:${agentId}:${state.chatSessionMainKey || 'main'}`;
+}
+
+function _normalizeChatActor(msg) {
+  const role = String(msg.role || msg.sender || msg.type || '').toLowerCase();
+  if (role === 'user' || role === 'human' || role === 'operator' || role === 'client') return 'user';
+  return 'agent';
+}
+
+function _normalizeOpenclawChatHistory(payload, agentId) {
+  const source = payload?.messages || payload?.history || payload?.transcript || [];
+  if (!Array.isArray(source)) return [];
+  return source.map((item) => {
+    const text = item.text || item.content || item.message || item.output || item.delta || item.contentBlock?.text || item.body;
+    if (!text) return null;
+    return {
+      from: _normalizeChatActor(item),
+      text: String(text),
+      ts: item.ts || item.timestamp || item.time || item.createdAt || item.updatedAt || ts(),
+      agentId: item.agentId || agentId,
+    };
+  }).filter(Boolean);
+}
+
+function _mergeOpenclawChatHistory(agentId, incoming) {
+  const existing = state.chatMessages[agentId] || [];
+  const seen = new Set(existing.map(m => `${m.from}|${m.text}|${m.ts}`));
+  const merged = [...existing];
+  incoming.forEach((msg) => {
+    const key = `${msg.from}|${msg.text}|${msg.ts}`;
+    if (!seen.has(key)) {
+      merged.push(msg);
+      seen.add(key);
+    }
+  });
+  merged.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+  if (merged.length > DATA_CAPS.chatPerAgent) {
+    return merged.slice(-DATA_CAPS.chatPerAgent);
+  }
+  return merged;
+}
+
+function _normalizeOpenclawChatEvent(payload, fallbackAgentId) {
+  if (!payload || typeof payload !== 'object') return null;
+  const text = payload.text
+    || payload.content
+    || payload.message
+    || payload.output
+    || payload.delta
+    || payload.contentBlock?.text
+    || payload.body
+    || payload.chunk;
+  if (!text) return null;
+  const role = String(payload.role || payload.sender || payload.type || '').toLowerCase();
+  return {
+    from: role === 'user' || role === 'human' || role === 'operator' || role === 'client' ? 'user' : 'agent',
+    text: String(text),
+    ts: payload.ts || payload.timestamp || payload.time || payload.createdAt || payload.updatedAt || ts(),
+    agentId: payload.agentId || fallbackAgentId || state.activeChat,
+  };
+}
+
+function _normalizeOpenclawEventPayload(payload) {
+  const source = payload?.payload || payload?.data || payload;
+  const event = _normalizeOpenclawEventName(payload?.event || payload?.name || '');
+  if (!event) return { event: '', data: source, handled: false };
+  if (!OPENCLAW_EVENT_TYPES.has(event)) return { event, data: source, handled: false };
+  return { event, data: source, handled: true };
+}
+
+function _handleOpenclawEventMessage(msg) {
+  const { event, data, handled } = _normalizeOpenclawEventPayload(msg);
+  if (!handled) return false;
+
+  if (event === 'connect.challenge' || event === 'connect.challenge_ack') {
+    if (_openclawHelloAt === 0 && _openclawConnectSession) {
+      _openclawConnectChallengeCount = (_openclawConnectChallengeCount || 0) + 1;
+      if (_openclawConnectChallengeCount <= 3 && state.ws && state.ws.readyState === WebSocket.OPEN) {
+        _openclawConnectChallenge = _extractOpenclawPayload(data) || data;
+        _sendOpenclawRequest(
+          'connect',
+          _buildOpenclawConnectPayload(
+            OPENCLAW_CONNECT_SCOPES,
+            _openclawConnectChallenge
+          ),
+          Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000)
+        )
+          .catch((err) => {
+            console.debug('[CommandCenter] connect retry after challenge failed:', err.message);
+          });
+      }
+    }
+    return true;
+  }
+
+  if (event === 'hello' || event === 'hello-ok' || event === 'hello_ok' || event === 'connected') {
+    if (_openclawPendingHelloApply) {
+      _openclawPendingHelloApply(data);
+      _openclawPendingHelloApply = null;
+    }
+    return true;
+  }
+
+  if (event === 'chat' || event === 'chat.message' || event === 'chat.stream') {
+    const normalized = _normalizeOpenclawChatEvent(data, data?.agentId || data?.agent || state.activeChat);
+    if (!normalized || !normalized.agentId) return true;
+    if (!state.chatMessages[normalized.agentId]) state.chatMessages[normalized.agentId] = [];
+    state.chatMessages[normalized.agentId].push({
+      from: normalized.from,
+      text: normalized.text,
+      ts: ts(),
+    });
+    _saveChatMessages();
+    const typing = $('#chat-typing');
+    if (typing) typing.classList.remove('show');
+    if (state.activeChat === normalized.agentId && state.activeView === 'chat') {
+      renderChat();
+    }
+    return true;
+  }
+
+  if (event === 'presence' || event === 'system-presence' || event === 'presence_update') {
+    if (Array.isArray(data)) {
+      data.forEach(item => {
+        if (item?.agentId && item.status) {
+          state.agentStatus[item.agentId] = item.status;
+        }
+      });
+      renderAgentPills();
+      renderOrgChart();
+    }
+    return true;
+  }
+
+  if (event === 'models' || event === 'model' || event === 'models.list' || event === 'model.list') {
+    const mapped = _normalizeOpenclawModelsPayload(data || []);
+    if (mapped.length) {
+      state.gatewayModels = mapped;
+      _safeSave('oc_gatewayModels', state.gatewayModels);
+      renderAll();
+    }
+    return true;
+  }
+
+  if (event === 'agent' && data?.agentId) {
+    const normalized = _normalizeOpenclawChatEvent(data, data?.agentId || state.activeChat);
+    if (!normalized || !normalized.agentId) return true;
+    if (!state.chatMessages[normalized.agentId]) state.chatMessages[normalized.agentId] = [];
+    state.chatMessages[normalized.agentId].push({
+      from: normalized.from,
+      text: normalized.text,
+      ts: ts(),
+    });
+    _saveChatMessages();
+    const typing = $('#chat-typing');
+    if (typing) typing.classList.remove('show');
+    if (state.activeChat === normalized.agentId && state.activeView === 'chat') {
+      renderChat();
+    }
+    return true;
+  }
+
+  if (event === 'state_restore' || event === 'state.restore') {
+    _storage.handleStateRestore(data);
+    return true;
+  }
+
+  if (event === 'state_ack' || event === 'state.ack') {
+    _storage.handleStateAck(data);
+    return true;
+  }
+
+  if (event === 'state_conflict' || event === 'state.conflict') {
+    _syncGatewayStateConflict(data);
+    return true;
+  }
+
+  if (event === 'vault_request' && data?.agentId && data?.requestId) {
+    _handleVaultRequest({
+      ...data,
+      agentId: data.agentId,
+      requestId: data.requestId,
+      envKey: data.envKey,
+    });
+    return true;
+  }
+
+  if (event === 'agent_comms' && data?.from && data?.to) {
+    window.__openclaw_cc.pushComms(data);
+    return true;
+  }
+
+  if (event === 'meeting_message' && data?.agentId) {
+    window.__openclaw_cc.meetingMessage({
+      agent: data.agentId,
+      text: data.text || data.content,
+      type: data.messageType || 'message',
+    });
+    return true;
+  }
+
+  if (event === 'routing_ack') {
+    if (data?.agentId) console.log(`[Routing] ${data.agentId} acknowledged routing update`);
+    return true;
+  }
+
+  return false;
+}
+
+function _handleOpenclawGatewayMessage(msg) {
+  if (_handleOpenclawResponse(msg)) return true;
+  if (_handleOpenclawEventMessage(msg)) return true;
+  return false;
+}
+
+function _sendOpenclawOrLegacy(openclawMethod, openclawParams, legacyBuilder) {
+  if (!_isGatewayConnected()) return false;
+  if (_isOpenclawConnectedMode()) {
+    return _sendOpenclawRequestAsLegacyFallback(openclawMethod, openclawParams, () => {
+      if (typeof legacyBuilder === 'function') {
+        return legacyBuilder();
+      }
+      return null;
+    });
+  }
+  if (typeof legacyBuilder === 'function') return legacyBuilder();
+  return false;
+}
+
+function _sendOpenclawRequestAsLegacyFallback(method, params, fallback) {
+  return _sendOpenclawRequest(method, params, OPENCLAW_CONNECT_TIMEOUT_MS)
+    .catch((err) => {
+      if (_openclawConnectSession) {
+        _openclawPendingHelloApply = null;
+      }
+
+      if (fallback) {
+        return fallback();
+      }
+      throw err;
+    });
+}
+
+function _sendGatewayChatMessage(agentId, text, extra = {}) {
+  const message = text == null ? '' : String(text);
+  const chatPayload = {
+    agentId,
+    sessionKey: _chatSessionKey(agentId),
+    message: message,
+    text: message,
+    idempotencyKey: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    ...extra,
+  };
+  return _sendOpenclawOrLegacy('chat.send', {
+    ...chatPayload,
+  }, () => {
+    _sendGatewayPayload({
+      type: 'message',
+      agentId,
+      text,
+      ...extra,
+    });
+    return true;
+  });
+}
+
+function _sendVaultManifestToGateway(manifest) {
+  return _sendOpenclawOrLegacy('vault.manifest', { manifest }, () => {
+    state.ws.send(JSON.stringify({
+      type: 'vault_manifest',
+      manifest,
+      timestamp: Date.now(),
+    }));
+    return true;
+  });
+}
+
+function _sendStateToGateway(payload) {
+  const statePayload = { ...payload };
+  delete statePayload._config;
+  return _sendOpenclawOrLegacy('state.sync', {
+    state: statePayload,
+    savedAt: _storage._lastSaveTs,
+    schema: OC_SCHEMA_VERSION,
+    version: OC_VERSION,
+  }, () => {
+    if (!(_storage._gatewaySyncEnabled && state.ws)) return false;
+    state.ws.send(JSON.stringify({
+      type: 'state_sync',
+      savedAt: _storage._lastSaveTs,
+      schema: OC_SCHEMA_VERSION,
+      version: OC_VERSION,
+      state: statePayload,
+    }));
+    return true;
+  });
+}
+
+function _requestStateFromGateway() {
+  const body = {
+    localSavedAt: _storage._lastSaveTs || 0,
+    schema: OC_SCHEMA_VERSION,
+    version: OC_VERSION,
+  };
+  return _sendOpenclawOrLegacy('state.request', body, () => {
+    if (!state.ws) return false;
+    state.ws.send(JSON.stringify({
+      type: 'state_request',
+      localSavedAt: _storage._lastSaveTs || 0,
+      schema: OC_SCHEMA_VERSION,
+      version: OC_VERSION,
+    }));
+    return true;
+  });
+}
+
+function _sendVaultResponseToGateway(requestId, response) {
+  return _sendOpenclawOrLegacy('vault.response', {
+    requestId,
+    ...response,
+  }, () => {
+    if (!state.ws) return false;
+    state.ws.send(JSON.stringify({
+      type: 'vault_response',
+      requestId,
+      ...response,
+    }));
+    return true;
+  });
+}
+
+function _sendCronUpdateToGateway(job) {
+  return _sendOpenclawOrLegacy('cron.update', {
+    job,
+  }, () => {
+    if (!state.ws) return false;
+    state.ws.send(JSON.stringify({
+      type: 'cron_update',
+      job,
+    }));
+    return true;
+  });
+}
+
+function _sendCronRunToGateway(agentId, payload) {
+  return _sendOpenclawOrLegacy('cron.run_now', {
+    agentId,
+    ...payload,
+  }, () => {
+    if (!state.ws) return false;
+    state.ws.send(JSON.stringify({
+      type: 'message',
+      ...payload,
+    }));
+    return true;
+  });
+}
+
+function _sendRoutingUpdateToGateway(agentId, payload) {
+  return _sendOpenclawOrLegacy('agent.routing.update', {
+    agentId,
+    ...payload,
+  }, () => {
+    state.ws.send(JSON.stringify({
+      type: 'routing_update',
+      ...payload,
+    }));
+    const messagePayload = {
+      agentId: payload?.agentId,
+      text: payload?.directive || '[ROUTING UPDATE]',
+      system: true,
+    };
+    _sendGatewayPayload({
+      type: 'message',
+      ...messagePayload,
+      ...payload,
+    });
+    return true;
+  });
+}
+
+function _sendPromptUpdateToGateway(agentId, payload) {
+  return _sendOpenclawOrLegacy('prompt.update', {
+    agentId,
+    ...payload,
+  }, () => {
+    _sendGatewayPayload({
+      type: 'prompt_update',
+      ...payload,
+    });
+    return true;
+  });
+}
+
+function _setGatewayStatusDisconnected(msg, el) {
+  if (!el) return;
+  el.className = 'disconnected';
+  el.title = msg;
 }
 
 const __agentInstallConfig = _getAgentInstallConfig();
@@ -3095,38 +4078,14 @@ const _storage = {
   // ── GATEWAY SYNC ──
   _syncToGateway(snap) {
     if (!this._gatewaySyncEnabled || !state.connected || !state.ws) return;
-    try {
-      // Strip config (has auth token) — gateway already has it
-      const payload = { ...snap };
-      delete payload._config;
-      state.ws.send(JSON.stringify({
-        type: 'state_sync',
-        savedAt: this._lastSaveTs,
-        schema: OC_SCHEMA_VERSION,
-        version: OC_VERSION,
-        state: payload,
-      }));
-      console.log('[Sync] State pushed to gateway');
-    } catch(e) {
-      console.warn('[Sync] Failed to push state to gateway:', e.message);
-    }
+    const payload = { ...snap };
+    _sendStateToGateway(payload);
   },
 
   requestStateFromGateway() {
     if (!state.connected || !state.ws) return;
     this._pendingStateRequest = true;
-    try {
-      state.ws.send(JSON.stringify({
-        type: 'state_request',
-        localSavedAt: this._lastSaveTs || 0,
-        schema: OC_SCHEMA_VERSION,
-        version: OC_VERSION,
-      }));
-      console.log('[Sync] Requested state from gateway');
-    } catch(e) {
-      this._pendingStateRequest = false;
-      console.warn('[Sync] state_request failed:', e.message);
-    }
+    return _requestStateFromGateway();
   },
 
   handleStateRestore(msg) {
@@ -4155,29 +5114,37 @@ function connectGateway() {
   if (state.ws) { state.ws.close(); state.ws = null; }
   const el = $('#conn-status');
   el.className = 'connecting'; el.title = 'Connecting...';
+  _setGatewayStatusDisconnected('Gateway: disconnected', el);
+  const preferredMode = _gatewayProtocolPreference === 'auto' ? 'openclaw' : _gatewayProtocolPreference;
+  _gatewayProtocolRuntimeMode = preferredMode;
 
   try {
-    const url = state.authToken
-      ? `${normalizedGatewayUrl}?token=${encodeURIComponent(state.authToken)}`
-      : normalizedGatewayUrl;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(normalizedGatewayUrl);
     state.ws = ws;
 
     ws.onopen = () => {
-      state.connected = true;
-      _reconnectAttempt = 0; // Reset backoff on success
-      el.className = 'connected'; el.title = 'Gateway: connected';
-      console.log('[CommandCenter] Connected to Gateway');
-      // Subscribe to sessions/events
-      ws.send(JSON.stringify({ type: 'subscribe', channels: ['sessions','presence','config'] }));
-      // Request available models from gateway
-      ws.send(JSON.stringify({ type: 'get_models' }));
-      // Request stored state from gateway (persistence protocol)
-      _storage.requestStateFromGateway();
-      // Push current routing to all agents
-      _syncAllRouting('reconnect');
-      // Push vault manifest
-      _syncVaultToGateway();
+      el.className = 'connecting';
+      el.title = `Connecting... (${preferredMode})`;
+      _clearOpenclawRequests('reconnect-reset');
+
+      if (_gatewayNegotiationTimer) {
+        clearTimeout(_gatewayNegotiationTimer);
+        _gatewayNegotiationTimer = null;
+      }
+
+      console.log('[CommandCenter] Gateway socket open, bootstrapping', preferredMode);
+
+      if (preferredMode === 'legacy') {
+        _startLegacyBootstrap();
+      } else {
+        _startOpenclawBootstrap();
+        _gatewayNegotiationTimer = setTimeout(() => {
+          _gatewayProtocolRuntimeMode = 'openclaw';
+          if (_gatewayProtocolPreference === 'openclaw' && _isOpenclawConnectedMode() && !state.connected) {
+            _gatewayProtocolRuntimeMode = 'openclaw';
+          }
+        }, Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 4500));
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -4188,7 +5155,13 @@ function connectGateway() {
     };
 
     ws.onclose = () => {
+      _clearOpenclawRequests('close');
+      if (_gatewayNegotiationTimer) {
+        clearTimeout(_gatewayNegotiationTimer);
+        _gatewayNegotiationTimer = null;
+      }
       state.connected = false;
+      _gatewayProtocolRuntimeMode = _gatewayProtocolPreference;
       _storage.handleGatewayDisconnect();
       el.className = 'disconnected'; el.title = 'Gateway: disconnected';
       console.log('[CommandCenter] Disconnected');
@@ -4215,6 +5188,8 @@ function handleGatewayMessage(msg) {
   // Route incoming Gateway protocol messages
   // These hooks let agents push data into the dashboard
   console.log('[Gateway]', msg);
+
+  if (_handleOpenclawGatewayMessage(msg)) return;
 
   if (msg.type === 'message' && msg.agentId) {
     const agentId = msg.agentId;
@@ -4701,13 +5676,11 @@ window.__openclaw_cc = {
     const prompt = state.agentPrompts[agentId] || _getDefaultPrompt(agentId);
     const compiled = _compilePrompt(agentId, prompt);
     if (state.connected && state.ws) {
-      state.ws.send(JSON.stringify({
-        type: 'prompt_update',
-        agentId,
+      _sendPromptUpdateToGateway(agentId, {
         prompt: compiled,
         sections: prompt,
         timestamp: Date.now(),
-      }));
+      });
       _autoLog('system', agentId, `System prompt pushed to Gateway`, `${compiled.length} chars`);
       return { ok:true, pushed:true, length: compiled.length };
     }
@@ -6223,9 +7196,7 @@ function _pushRoutingToAgent(agentId) {
     directive += `- Verify live: canvas.eval → __openclaw_cc.getConnectedAgents("${agentId}")\n`;
   }
 
-  // Send as system message to agent
-  state.ws.send(JSON.stringify({
-    type: 'routing_update',
+  _sendRoutingUpdateToGateway(agentId, {
     agentId,
     directive,
     connections: allowedIds,
@@ -6233,15 +7204,7 @@ function _pushRoutingToAgent(agentId) {
     downstream: r.downstream.map(d => d.id),
     lateral: r.lateral.map(l => l.id),
     timestamp: Date.now(),
-  }));
-
-  // Also send as a regular message the agent can read
-  state.ws.send(JSON.stringify({
-    type: 'message',
-    agentId,
-    text: directive,
-    system: true,
-  }));
+  });
 }
 
 function _updateSyncIndicator(status) {
@@ -6385,9 +7348,7 @@ function sendChatMessage() {
 
   // If connected, send via Gateway WS
   if (state.connected && state.ws) {
-    state.ws.send(JSON.stringify({
-      type: 'message', agentId, text,
-    }));
+    _sendGatewayChatMessage(agentId, text);
     // Show typing indicator until response arrives
     const typing = $('#chat-typing');
     typing.classList.add('show');
@@ -7085,13 +8046,12 @@ function _runCronNow(jobId) {
   // Push to each assigned agent via Gateway
   if (state.connected && state.ws) {
     (job.agents || []).forEach(agentId => {
-      state.ws.send(JSON.stringify({
-        type: 'message',
+      _sendCronRunToGateway(agentId, {
         agentId,
         text: `[CRON: ${job.name}] ${job.message}`,
         system: true,
         cronJobId: job.id,
-      }));
+      });
     });
     job.lastRun = ts();
     job.runs = (job.runs || 0) + 1;
@@ -7114,17 +8074,14 @@ function _runCronNow(jobId) {
 // ── Sync cron job config to Gateway ──
 function _syncCronToGateway(job) {
   if (!state.connected || !state.ws) return;
-  state.ws.send(JSON.stringify({
-    type: 'cron_update',
-    job: {
-      id: job.id,
-      name: job.name,
-      agents: job.agents,
-      schedule: job.schedule,
-      message: job.message,
-      enabled: job.enabled,
-    },
-  }));
+  _sendCronUpdateToGateway({
+    id: job.id,
+    name: job.name,
+    agents: job.agents,
+    schedule: job.schedule,
+    message: job.message,
+    enabled: job.enabled,
+  });
 }
 
 // Bind add button and modal events
@@ -7965,11 +8922,7 @@ function _syncVaultToGateway() {
     fieldKeys: (s.fields||[]).map(f => f.key),
     allowList: s.allowList,
   }));
-  state.ws.send(JSON.stringify({
-    type: 'vault_manifest',
-    manifest,
-    timestamp: Date.now(),
-  }));
+  _sendVaultManifestToGateway(manifest);
 }
 
 // Agent-facing vault helper — clean interface for canvas.eval
@@ -7986,13 +8939,7 @@ window.vault = function(keyPath, agentId) {
 function _handleVaultRequest(msg) {
   // msg: { type:'vault_request', envKey:'FIREBASE.PRIVATE_KEY', agentId:'forge', requestId:'...' }
   const result = window.__openclaw_cc.getSecret(msg.envKey, msg.agentId);
-  if (state.ws) {
-    state.ws.send(JSON.stringify({
-      type: 'vault_response',
-      requestId: msg.requestId,
-      ...result,
-    }));
-  }
+  _sendVaultResponseToGateway(msg.requestId, result);
   if (result.ok) {
     _autoLog('system', msg.agentId, `Vault access: ${msg.envKey}`, `Granted`);
   } else {
@@ -8763,11 +9710,7 @@ function startMeeting() {
 
   // If connected to Gateway, send meeting start to lead agent
   if (state.connected && state.ws) {
-    state.ws.send(JSON.stringify({
-      type: 'message',
-      agentId: participants[0], // lead agent
-      text: `Start a meeting about: ${topic}. Type: ${type}. Participants: ${participants.join(', ')}. Use agent-send to engage other agents. Push all responses to the Command Center via canvas.eval: window.__openclaw_cc.meetingMessage({agent:'YOUR_ID', text:'YOUR_MESSAGE'})`,
-    }));
+    _sendGatewayChatMessage(participants[0], `Start a meeting about: ${topic}. Type: ${type}. Participants: ${participants.join(', ')}. Use agent-send to engage other agents. Push all responses to the Command Center via canvas.eval: window.__openclaw_cc.meetingMessage({agent:'YOUR_ID', text:'YOUR_MESSAGE'})`, { system: true });
   }
 
   // Demo mode: simulate the meeting
