@@ -2955,7 +2955,9 @@ const OPENCLAW_DEVICE_KEYPAIR_KEY = 'oc_openclaw_device_keypair';
 const OPENCLAW_DEVICE_AUTH_VERSION_V1 = 'v1';
 const OPENCLAW_DEVICE_AUTH_VERSION_V2 = 'v2';
 const OPENCLAW_CLIENT_ID = 'openclaw-control-ui';
-const OPENCLAW_CLIENT_MODE = 'operator';
+const OPENCLAW_CLIENT_MODE_KEY = 'oc_openclaw_client_mode';
+const OPENCLAW_CLIENT_MODE_CANDIDATES = ['operator', 'control-ui', 'control_ui', 'control', 'web'];
+let _openclawClientMode = 'operator';
 const OPENCLAW_BOOTSTRAP_LOG_LIMIT = 60;
 const _openclawBootstrapLog = [];
 
@@ -2994,6 +2996,33 @@ function _resolveConnectModeForCurrentState() {
   if (_gatewayProtocolPreference === 'openclaw') return 'openclaw';
   return 'legacy';
 }
+
+function _readOpenclawClientModePreference() {
+  try {
+    const raw = (localStorage.getItem(OPENCLAW_CLIENT_MODE_KEY) || '').trim().toLowerCase();
+    if (OPENCLAW_CLIENT_MODE_CANDIDATES.includes(raw)) return raw;
+  } catch(e) {}
+  return 'operator';
+}
+
+function _saveOpenclawClientModePreference(mode) {
+  const normalized = String(mode || '').trim().toLowerCase();
+  if (!OPENCLAW_CLIENT_MODE_CANDIDATES.includes(normalized)) return;
+  _openclawClientMode = normalized;
+  try { localStorage.setItem(OPENCLAW_CLIENT_MODE_KEY, normalized); } catch(e) {}
+}
+
+function _getOpenclawClientModeCandidates() {
+  const preferred = _openclawClientMode || 'operator';
+  return [preferred, ...OPENCLAW_CLIENT_MODE_CANDIDATES.filter((m) => m !== preferred)];
+}
+
+function _isOpenclawClientModeError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return /client\/mode|client\.mode|\/client\/mode|must be equal to constant/.test(msg);
+}
+
+_openclawClientMode = _readOpenclawClientModePreference();
 
 function _clearOpenclawRequests(reason = 'disconnect') {
   _openclawReqs.forEach((entry) => {
@@ -3161,7 +3190,7 @@ function _getOpenclawClientInstanceId() {
   }
 }
 
-async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) {
+async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken, clientMode = _openclawClientMode) {
   const base = _getOpenclawDeviceIdentity(challengePayload);
   const challengeData = _extractOpenclawPayload(challengePayload);
   const challengeTs = Number(challengeData?.ts || challengeData?.timestamp || challengeData?.signedAt);
@@ -3172,7 +3201,8 @@ async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) 
   const hasChallengeNonce = !!nonce;
   const version = hasChallengeNonce ? OPENCLAW_DEVICE_AUTH_VERSION_V2 : OPENCLAW_DEVICE_AUTH_VERSION_V1;
   const normalizedScopes = scopeList.map((scope) => String(scope || '').trim()).filter(Boolean);
-  const challengePayloadText = `${version}|${base?.id || 'device'}|${OPENCLAW_CLIENT_ID}|${OPENCLAW_CLIENT_MODE}|operator|${normalizedScopes.join(',')}|${signedAt}|${token}${hasChallengeNonce ? `|${nonce}` : ''}`;
+  const normalizedMode = String(clientMode || _openclawClientMode || 'operator').trim().toLowerCase();
+  const challengePayloadText = `${version}|${base?.id || 'device'}|${OPENCLAW_CLIENT_ID}|${normalizedMode}|operator|${normalizedScopes.join(',')}|${signedAt}|${token}${hasChallengeNonce ? `|${nonce}` : ''}`;
 
   const keyPair = await _ensureOpenclawDeviceKeyPair();
   if (!keyPair?.privateKey || !keyPair?.publicKeyString) return null;
@@ -3520,8 +3550,9 @@ function _isOpenclawStatePayload(payload) {
   return STATE_KEYS.some((key) => Object.prototype.hasOwnProperty.call(payload, key));
 }
 
-async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null) {
+async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null, clientMode = _openclawClientMode) {
   const challengeData = _extractOpenclawPayload(challenge || {});
+  const normalizedMode = String(clientMode || _openclawClientMode || 'operator').trim().toLowerCase();
   const auth = challengeData?.auth || {};
   const authPayload = {
     ...auth,
@@ -3535,7 +3566,7 @@ async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, ch
       id: OPENCLAW_CLIENT_ID,
       version: '1.0.0',
       platform: 'web',
-      mode: OPENCLAW_CLIENT_MODE,
+      mode: normalizedMode,
     },
     role: 'operator',
     scopes,
@@ -3545,7 +3576,7 @@ async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, ch
     locale: navigator.language || 'en-US',
     userAgent: `openclaw-control-ui (${navigator.userAgent || 'web'})`,
   };
-  const signedDevice = await _buildOpenclawDevicePayload(challengeData, scopes, authPayload?.token || '');
+  const signedDevice = await _buildOpenclawDevicePayload(challengeData, scopes, authPayload?.token || '', normalizedMode);
   if (signedDevice?.id && signedDevice?.publicKey && signedDevice?.signature) {
     payload.device = signedDevice;
   } else if (state.authToken && window.isSecureContext === true) {
@@ -3635,15 +3666,25 @@ function _normalizeOpenclawModelsPayload(payload) {
   return normalized;
 }
 
-function _connectOpenclawSession(scopes, challengePayload = null, timeoutMs = Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000), onSuccess) {
-  return _buildOpenclawConnectPayload(scopes, challengePayload)
-    .then((payload) => _sendOpenclawRequest('connect', payload, timeoutMs))
-    .then((payload) => {
-      if (typeof onSuccess === 'function') {
-        onSuccess(payload);
-      }
-      return payload;
-    });
+async function _connectOpenclawSession(scopes, challengePayload = null, timeoutMs = Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000), onSuccess) {
+  const candidates = _getOpenclawClientModeCandidates();
+  let lastErr = null;
+
+  for (const mode of candidates) {
+    try {
+      const payload = await _buildOpenclawConnectPayload(scopes, challengePayload, mode);
+      const response = await _sendOpenclawRequest('connect', payload, timeoutMs);
+      _saveOpenclawClientModePreference(mode);
+      if (typeof onSuccess === 'function') onSuccess(response);
+      return response;
+    } catch (err) {
+      lastErr = err;
+      if (!_isOpenclawClientModeError(err)) throw err;
+      console.warn(`[CommandCenter] connect rejected client.mode="${mode}", trying next mode...`);
+    }
+  }
+
+  throw lastErr || new Error('OpenClaw connect failed');
 }
 
 function _startOpenclawBootstrap() {
