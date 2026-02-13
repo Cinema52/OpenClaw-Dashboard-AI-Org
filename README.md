@@ -71,6 +71,22 @@ echo $BOOTSTRAP_URL
 
 Expected result: dashboard renders with prefilled gateway config and begins connect attempts automatically.
 
+### OpenClaw Gateway Connection Checklist (for existing users/gateways)
+
+If you still see **Gateway: Disconnected** and no data sync:
+
+- Verify gateway is running: `openclaw gateway`
+- Verify the token in Settings matches `gateway.auth.token` (or `OPENCLAW_GATEWAY_TOKEN`) on the host.
+- Use a direct URL so it is guaranteed to be parsed by the app:
+  - `http://127.0.0.1:8080/index-2.html?gateway=ws://127.0.0.1:18789&token=<token>` (local dashboard host)
+  - `https://<your-dashboard-host>/index-2.html?gateway=wss://<gateway-host>:18789&token=<token>` (remote dashboard host)
+- For remote installs, clear URL params first if needed and re-open so token is reloaded from local storage.
+- If the close code includes `pairing required`, you must approve the device once on the gateway host:
+  - `openclaw devices list`
+  - `openclaw devices approve <request-id>`
+- After approval, refresh the dashboard and wait for state restore:
+  - check `Gateway state` banner → `synced`, and then open an existing agent chat.
+
 ---
 
 ## Features

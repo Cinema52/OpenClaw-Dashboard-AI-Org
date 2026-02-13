@@ -3448,21 +3448,29 @@ function _handleOpenclawResponse(msg) {
 
   if (_isOpenclawStateRequestMethod(req.method)) {
     const candidate = body?.state || body?.snapshot || body?.data?.state || body?.data?.snapshot || body?.payload?.state || body?.payload?.snapshot;
+    const explicitNoState =
+      body?.hasState === false ||
+      body?.stateExists === false ||
+      body?.empty === true ||
+      body?.isEmpty === true ||
+      candidate === null;
     if (candidate && typeof candidate === 'object') {
-      if (!Object.keys(candidate).length) {
-        _storage.handleStateRestore({ state: {} });
-      } else if (_isOpenclawStatePayload(candidate)) {
+      if (_isOpenclawStatePayload(candidate)) {
         _storage.handleStateRestore({
           state: candidate,
           savedAt: candidate._savedAt || body._savedAt || body.savedAt || 0,
         });
-      } else if (candidate.models || candidate.stateVersion || candidate.health || candidate.presence || candidate.agents) {
-        // Snapshot-like data from hello response without local dashboard state keys.
-        // Preserve gateway metadata and avoid clobbering.
-        _storage.handleStateRestore({ state: {} });
+      } else if (!Object.keys(candidate).length || candidate.models || candidate.stateVersion || candidate.health || candidate.presence || candidate.agents) {
+        // Fail closed: do not treat metadata/empty payloads as "no state",
+        // otherwise we can overwrite existing gateway state with local defaults.
+        _storage._pendingStateRequest = false;
+        console.warn('[Sync] State request returned metadata/empty payload without dashboard snapshot; keeping local state.');
       }
-    } else if (candidate === null || candidate === undefined) {
-      _storage.handleStateRestore({});
+    } else if (explicitNoState) {
+      _storage.handleStateRestore({ state: null, explicitNoState: true });
+    } else if (candidate === undefined) {
+      _storage._pendingStateRequest = false;
+      console.warn('[Sync] State request response did not include a snapshot payload; keeping local state.');
     }
   }
 
@@ -4637,14 +4645,30 @@ const _storage = {
     // Gateway sends stored state back — merge by timestamp
     this._pendingStateRequest = false;
 
-    if (!msg.state) {
-      // Gateway has no stored state — this is a fresh gateway
-      console.log('[Sync] Gateway has no stored state — pushing local state');
+    const hasStateField = !!msg && typeof msg === 'object' && Object.prototype.hasOwnProperty.call(msg, 'state');
+    if (!hasStateField) {
+      console.warn('[Sync] Ignoring ambiguous state restore payload (missing "state" field)');
+      return;
+    }
+
+    if (msg.state == null) {
+      // Explicit no-state response from gateway: safe to seed with local state.
+      console.log('[Sync] Gateway explicitly reports no stored state — pushing local state');
       this._gatewaySynced = true;
       const snap = this._getSerializableState();
       snap._savedAt = this._lastSaveTs;
       this._syncToGateway(snap);
       _updateSaveIndicator('synced');
+      return;
+    }
+
+    if (typeof msg.state !== 'object') {
+      console.warn('[Sync] Ignoring invalid state restore payload (state is not an object)');
+      return;
+    }
+
+    if (!Object.keys(msg.state).length && !msg.explicitNoState) {
+      console.warn('[Sync] Ignoring empty state payload without explicit no-state marker');
       return;
     }
 
@@ -10613,6 +10637,21 @@ function saveAvatar() {
   _showToast({agent: _avEditingAgent, text: `${ag?.name || _avEditingAgent}'s look updated!`, level: 'success', ts: ts()});
 }
 
+function _retryGatewayConnectAfterRecovery(reason = 'recovery') {
+  if (state.connected || !state.gatewayUrl) return;
+  const wsState = state.ws?.readyState;
+  if (wsState === WebSocket.OPEN || wsState === WebSocket.CONNECTING) return;
+  const normalizedGateway = _normalizeGatewayUrl(state.gatewayUrl);
+  if (!_isGatewayUrl(normalizedGateway)) return;
+  state.gatewayUrl = normalizedGateway;
+  setTimeout(() => {
+    if (!state.connected) {
+      console.log(`[Boot] Re-attempting gateway connect after ${reason}`);
+      connectGateway();
+    }
+  }, 250);
+}
+
 // ── BOOT ────────────────────────────────────────────
 initAvatars();
 _closeBlockingOverlays();
@@ -10673,6 +10712,7 @@ setInterval(() => {
         });
         renderAll();
         renderChat();
+        _retryGatewayConnectAfterRecovery('idb restore');
         _showToast({ text: '✅ Data recovered from IndexedDB backup', level: 'success', ts: ts() });
       }
     } else if (meta?.savedAt && lsAgents) {
@@ -10693,6 +10733,8 @@ setInterval(() => {
     _updateSaveIndicator('saved');
     console.warn('[Boot] Running without IndexedDB — data is less durable');
   }
+
+  _retryGatewayConnectAfterRecovery('async boot');
 
   // Set version label
   const vEl = $('#cc-version');
