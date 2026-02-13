@@ -80,6 +80,7 @@ If you still see **Gateway: Disconnected** and no data sync:
 - Use a direct URL so it is guaranteed to be parsed by the app:
   - `http://127.0.0.1:8080/index-2.html?gateway=ws://127.0.0.1:18789&token=<token>` (local dashboard host)
   - `https://<your-dashboard-host>/index-2.html?gateway=wss://<gateway-host>:18789&token=<token>` (remote dashboard host)
+- If connect fails with `origin not allowed`, add your dashboard origin to gateway config: `gateway.controlUi.allowedOrigins` (for example `http://localhost:8080`, `http://localhost:8765`, `https://<your-dashboard-host>`), then reconnect.
 - For remote installs, clear URL params first if needed and re-open so token is reloaded from local storage.
 - If the close code includes `pairing required`, you must approve the device once on the gateway host:
   - `openclaw devices list`
