@@ -2992,9 +2992,21 @@ function _setGatewayProtocolMode(mode) {
 }
 
 function _resolveConnectModeForCurrentState() {
-  if (_gatewayProtocolPreference === 'auto') return 'openclaw';
+  if (_gatewayProtocolPreference === 'auto') {
+    if (!_isOpenclawTrustedOrigin()) return 'legacy';
+    return 'openclaw';
+  }
   if (_gatewayProtocolPreference === 'openclaw') return 'openclaw';
   return 'legacy';
+}
+
+function _isOpenclawTrustedOrigin() {
+  try {
+    if (location.protocol === 'https:') return true;
+    const host = String(location.hostname || '').toLowerCase();
+    if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+  } catch (e) {}
+  return false;
 }
 
 function _readOpenclawClientModePreference() {
@@ -3014,12 +3026,20 @@ function _saveOpenclawClientModePreference(mode) {
 
 function _getOpenclawClientModeCandidates() {
   const preferred = _openclawClientMode || 'operator';
-  return [preferred, ...OPENCLAW_CLIENT_MODE_CANDIDATES.filter((m) => m !== preferred)];
+  const ordered = [preferred, ...OPENCLAW_CLIENT_MODE_CANDIDATES.filter((m) => m !== preferred)];
+  let secureContext = false;
+  try {
+    secureContext = window.isSecureContext === true;
+  } catch (e) {}
+  if (!secureContext || !_isOpenclawTrustedOrigin()) {
+    return ['operator', ...ordered.filter((m) => m !== 'operator')];
+  }
+  return ordered;
 }
 
 function _isOpenclawClientModeError(err) {
   const msg = String(err?.message || err || '').toLowerCase();
-  return /client\/mode|client\.mode|\/client\/mode|must be equal to constant/.test(msg);
+  return /client\/mode|client\.mode|\/client\/mode|must be equal to constant|control ui requires https or localhost|secure context/.test(msg);
 }
 
 _openclawClientMode = _readOpenclawClientModePreference();
@@ -4469,7 +4489,9 @@ if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
 if (__agentInstallConfig.protocolMode) {
   _setGatewayProtocolMode(__agentInstallConfig.protocolMode);
 } else if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
-  _setGatewayProtocolMode('openclaw');
+  // Default to legacy for non-trusted origins so one-click links still work
+  // when gateway policy requires HTTPS/localhost for control-ui connect mode.
+  _setGatewayProtocolMode(_isOpenclawTrustedOrigin() ? 'openclaw' : 'legacy');
 }
 
 if (__agentInstallConfig.gatewayUrl) {
@@ -5786,6 +5808,8 @@ function connectGateway() {
     try { state.ws.close(); } catch(e) {}
     state.ws = null;
   }
+  state.connected = false;
+  _storage.handleGatewayDisconnect();
 
   const el = $('#conn-status');
   _setGatewayStatusDisconnected('Gateway: disconnected', el);
@@ -5797,7 +5821,7 @@ function connectGateway() {
   const maxAttempts = candidates.length;
 
   const tryConnect = (attemptIndex) => {
-    if (generation !== _gatewayConnectGeneration || state.connected) return;
+    if (generation !== _gatewayConnectGeneration) return;
     const candidate = _gatewayConnectCandidates[Math.min(attemptIndex, maxAttempts - 1)];
     if (!candidate) return;
 
@@ -5819,7 +5843,7 @@ function connectGateway() {
       const ws = new WebSocket(candidate);
       state.ws = ws;
       ws.onopen = () => {
-        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        if (generation !== _gatewayConnectGeneration || state.ws !== ws) return;
         el.className = 'connecting';
         el.title = `Connecting... (${preferredMode})`;
         _clearOpenclawRequests('reconnect-reset');
@@ -5852,7 +5876,8 @@ function connectGateway() {
       };
 
       ws.onclose = (evt) => {
-        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        if (generation !== _gatewayConnectGeneration) return;
+        if (state.ws !== ws) return;
         _clearOpenclawRequests('close');
         if (_gatewayNegotiationTimer) {
           clearTimeout(_gatewayNegotiationTimer);
@@ -5900,7 +5925,8 @@ function connectGateway() {
       };
 
       ws.onerror = () => {
-        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        if (generation !== _gatewayConnectGeneration) return;
+        if (state.ws !== ws) return;
         el.className = 'disconnected';
         el.title = 'Gateway: error';
       };
