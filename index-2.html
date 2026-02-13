@@ -2965,6 +2965,7 @@ let _openclawLastConnectHasDevice = false;
 let _openclawSessionsCache = [];
 let _openclawSessionAgentIndex = new Map();
 let _openclawHelloMethodSet = new Set();
+const _openclawUnsupportedMethods = new Set();
 const OPENCLAW_DEVICE_ID_KEY = 'oc_openclaw_device_id';
 const OPENCLAW_DEVICE_KEYPAIR_KEY = 'oc_openclaw_device_keypair';
 const OPENCLAW_DEVICE_AUTH_VERSION_V1 = 'v1';
@@ -3803,9 +3804,19 @@ function _startOpenclawBootstrap() {
     const normalizeModelsFromResponse = (payload) => {
       const mapped = _normalizeOpenclawModelsPayload(payload);
       if (!mapped.length) return;
+      const prev = Array.isArray(state.gatewayModels) ? state.gatewayModels : [];
+      const sameSignature =
+        prev.length === mapped.length &&
+        prev.length > 0 &&
+        prev[0]?.id === mapped[0]?.id &&
+        prev[prev.length - 1]?.id === mapped[mapped.length - 1]?.id;
+      if (sameSignature) return;
       state.gatewayModels = mapped;
       _safeSave('oc_gatewayModels', state.gatewayModels);
-      _showToast({ text: `Loaded ${mapped.length} models from OpenClaw gateway`, level:'success', ts: ts() });
+      if (!state._modelsToastShown) {
+        state._modelsToastShown = true;
+        _showToast({ text: `Loaded ${mapped.length} models from OpenClaw gateway`, level:'success', ts: ts() });
+      }
     };
 
     const syncAgents = async () => {
@@ -4300,12 +4311,21 @@ function _handleOpenclawGatewayMessage(msg) {
 function _sendOpenclawOrLegacy(openclawMethod, openclawParams, legacyBuilder) {
   if (!_isGatewayConnected()) return false;
   if (_isOpenclawConnectedMode()) {
-    return _sendOpenclawRequestAsLegacyFallback(openclawMethod, openclawParams, () => {
-      if (typeof legacyBuilder === 'function') {
-        return legacyBuilder();
-      }
-      return null;
-    });
+    const method = String(openclawMethod || '').trim();
+    if (!method) return Promise.resolve(null);
+    if (_openclawUnsupportedMethods.has(method)) return Promise.resolve(null);
+    return _sendOpenclawRequest(method, openclawParams, OPENCLAW_CONNECT_TIMEOUT_MS)
+      .catch((err) => {
+        if (_openclawConnectSession) {
+          _openclawPendingHelloApply = null;
+        }
+        if (_isMethodUnavailableError(err, method)) {
+          _openclawUnsupportedMethods.add(method);
+          return null;
+        }
+        console.warn(`[CommandCenter] OpenClaw method failed: ${method}`, err?.message || err);
+        return null;
+      });
   }
   if (typeof legacyBuilder === 'function') return legacyBuilder();
   return false;
@@ -4884,12 +4904,6 @@ const _storage = {
   // Debounced save — coalesces rapid writes
   queueSave() {
     this._dirty = true;
-    const now = Date.now();
-    const threshold = 5000;
-    if (!this._nextSaveUiAt || now >= this._nextSaveUiAt) {
-      _updateSaveIndicator('saving');
-      this._nextSaveUiAt = now + threshold;
-    }
     if (this._saveTimer) clearTimeout(this._saveTimer);
     this._saveTimer = setTimeout(() => this.persistFullState(), 1500);
   },
@@ -5053,7 +5067,10 @@ const _storage = {
 };
 
 // ── SAVE INDICATOR ──
+let _saveIndicatorLastStatus = '';
 function _updateSaveIndicator(status) {
+  if (status === _saveIndicatorLastStatus) return;
+  _saveIndicatorLastStatus = status;
   const dot = $('#save-dot');
   const text = $('#save-text');
   if (!dot || !text) return;
