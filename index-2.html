@@ -3020,7 +3020,7 @@ function _isOpenclawTrustedOrigin() {
   try {
     if (location.protocol === 'https:') return true;
     const host = String(location.hostname || '').toLowerCase();
-    if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') return true;
   } catch (e) {}
   return false;
 }
@@ -3958,7 +3958,7 @@ function _startOpenclawBootstrap() {
       _openclawHelloAt = 0;
       const needsPairing = _openclawConnectErrorNeedsPairing(err);
       const originBlocked = _isOpenclawOriginBlockedError(err);
-      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled && !needsPairing && !originBlocked;
+      const fallback = _gatewayProtocolPreference === 'auto' && !_openclawFallbackScheduled && !needsPairing && !originBlocked;
       if (_openclawConnectSession === bootstrapSession) {
         _openclawPendingHelloApply = null;
       }
@@ -4422,22 +4422,8 @@ function _requestStateFromGateway() {
   return _sendOpenclawRequestAny(OPENCLAW_METHOD_ALIASES.stateRequest, body, OPENCLAW_CONNECT_TIMEOUT_MS, { allowFallback: true })
     .then(({ payload }) => payload)
     .catch((err) => {
-      if (_openclawConnectSession && _storage._gatewaySyncEnabled) {
-        console.warn('[CommandCenter] state request failed with aliases, trying legacy frame fallback:', err.message);
-      }
-      if (!state.ws) return Promise.reject(err);
-      try {
-        state.ws.send(JSON.stringify({
-          type: 'state_request',
-          localSavedAt: body.localSavedAt || 0,
-          schema: OC_SCHEMA_VERSION,
-          version: OC_VERSION,
-        }));
-      } catch(e) {
-        console.debug('[CommandCenter] legacy state request fallback send failed:', e.message);
-        throw err;
-      }
-      return { fallback: true };
+      console.warn('[CommandCenter] state request failed in OpenClaw mode (skipping legacy fallback):', err.message);
+      return null;
     });
 }
 
@@ -7949,9 +7935,11 @@ $('#routing-modal')?.addEventListener('click', e => {
 // Pushes routing rules to agents via Gateway on every wire change
 let _routingSyncDebounce = null;
 let _lastRoutingHash = '';
+let _lastRoutingSyncAt = 0;
+let _lastRoutingHintAt = 0;
 
 function _syncAllRouting(reason) {
-  if (!state.connected || !state.ws) {
+  if (!state.connected || !_isGatewayConnected()) {
     _updateSyncIndicator('offline');
     return;
   }
@@ -7961,10 +7949,14 @@ function _syncAllRouting(reason) {
   _routingSyncDebounce = setTimeout(() => {
     // Check if routing actually changed
     const hash = JSON.stringify(state.orgConnections.map(c => `${c.from}:${c.fromPort}-${c.to}:${c.toPort}`).sort());
+    const now = Date.now();
+    const reconnectSpam = reason === 'reconnect' && hash === _lastRoutingHash && (now - _lastRoutingSyncAt) < 15000;
+    if (reconnectSpam) return;
     if (hash === _lastRoutingHash && reason !== 'reconnect') {
       return; // No change
     }
     _lastRoutingHash = hash;
+    _lastRoutingSyncAt = now;
 
     console.log(`[Routing] Syncing to all agents (${reason})`);
     _updateSyncIndicator('syncing');
@@ -7984,12 +7976,16 @@ function _syncAllRouting(reason) {
       // Flash hint
       const hint = $('#org-hint');
       if (hint) {
-        hint.textContent = `✓ Routing synced to ${synced} agents`;
-        hint.style.color = 'var(--accent-green)';
-        setTimeout(() => {
-          hint.textContent = 'Drag ports to connect · Drag cards to arrange · Double-click wire to remove';
-          hint.style.color = 'var(--text-muted)';
-        }, 2500);
+        const canFlash = reason !== 'reconnect' || (Date.now() - _lastRoutingHintAt) > 15000;
+        if (canFlash) {
+          _lastRoutingHintAt = Date.now();
+          hint.textContent = `✓ Routing synced to ${synced} agents`;
+          hint.style.color = 'var(--accent-green)';
+          setTimeout(() => {
+            hint.textContent = 'Drag ports to connect · Drag cards to arrange · Double-click wire to remove';
+            hint.style.color = 'var(--text-muted)';
+          }, 2500);
+        }
       }
     }, 300);
   }, 300);
