@@ -3232,6 +3232,10 @@ function _asOpenclawMethodList(methods) {
   return [methods];
 }
 
+function _isOpenclawStateRequestMethod(method) {
+  return _asOpenclawMethodList(OPENCLAW_METHOD_ALIASES.stateRequest).includes(String(method || ''));
+}
+
 function _isMethodUnavailableError(err, method = '') {
   const raw = typeof err?.message === 'string' ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
   if (!raw) return false;
@@ -3442,10 +3446,12 @@ function _handleOpenclawResponse(msg) {
     return true;
   }
 
-  if (req.method === 'state.request') {
+  if (_isOpenclawStateRequestMethod(req.method)) {
     const candidate = body?.state || body?.snapshot || body?.data?.state || body?.data?.snapshot || body?.payload?.state || body?.payload?.snapshot;
-    if (candidate && typeof candidate === 'object' && Object.keys(candidate).length) {
-      if (_isOpenclawStatePayload(candidate)) {
+    if (candidate && typeof candidate === 'object') {
+      if (!Object.keys(candidate).length) {
+        _storage.handleStateRestore({ state: {} });
+      } else if (_isOpenclawStatePayload(candidate)) {
         _storage.handleStateRestore({
           state: candidate,
           savedAt: candidate._savedAt || body._savedAt || body.savedAt || 0,
@@ -3453,6 +3459,7 @@ function _handleOpenclawResponse(msg) {
       } else if (candidate.models || candidate.stateVersion || candidate.health || candidate.presence || candidate.agents) {
         // Snapshot-like data from hello response without local dashboard state keys.
         // Preserve gateway metadata and avoid clobbering.
+        _storage.handleStateRestore({ state: {} });
       }
     } else if (candidate === null || candidate === undefined) {
       _storage.handleStateRestore({});
@@ -4230,16 +4237,39 @@ function _requestStateFromGateway() {
     schema: OC_SCHEMA_VERSION,
     version: OC_VERSION,
   };
-  return _sendOpenclawOrLegacy('state.request', body, () => {
-    if (!state.ws) return false;
-    state.ws.send(JSON.stringify({
-      type: 'state_request',
-      localSavedAt: _storage._lastSaveTs || 0,
-      schema: OC_SCHEMA_VERSION,
-      version: OC_VERSION,
-    }));
-    return true;
-  });
+  if (!_isOpenclawConnectedMode()) {
+    return _sendOpenclawOrLegacy('state.request', body, () => {
+      if (!state.ws) return false;
+      state.ws.send(JSON.stringify({
+        type: 'state_request',
+        localSavedAt: _storage._lastSaveTs || 0,
+        schema: OC_SCHEMA_VERSION,
+        version: OC_VERSION,
+      }));
+      return true;
+    });
+  }
+
+  return _sendOpenclawRequestAny(OPENCLAW_METHOD_ALIASES.stateRequest, body, OPENCLAW_CONNECT_TIMEOUT_MS, { allowFallback: true })
+    .then(({ payload }) => payload)
+    .catch((err) => {
+      if (_openclawConnectSession && _storage._gatewaySyncEnabled) {
+        console.warn('[CommandCenter] state request failed with aliases, trying legacy frame fallback:', err.message);
+      }
+      if (!state.ws) return Promise.reject(err);
+      try {
+        state.ws.send(JSON.stringify({
+          type: 'state_request',
+          localSavedAt: body.localSavedAt || 0,
+          schema: OC_SCHEMA_VERSION,
+          version: OC_VERSION,
+        }));
+      } catch(e) {
+        console.debug('[CommandCenter] legacy state request fallback send failed:', e.message);
+        throw err;
+      }
+      return { fallback: true };
+    });
 }
 
 function _sendVaultResponseToGateway(requestId, response) {
