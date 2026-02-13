@@ -2625,9 +2625,13 @@ const BOOTSTRAP_TOKEN_KEYS = [
   'token', 'auth', 'auth_token', 'auth-token', 'gw_token', 'gateway_token',
   'agent_token', 'agent-token', 'openid_token', 'access_token', 'authorization'
 ];
+const BOOTSTRAP_PROTOCOL_KEYS = [
+  'protocol', 'protocol_mode', 'protocol-mode', 'gateway_protocol', 'gateway-protocol', 'mode'
+];
 const BOOTSTRAP_STRIP_KEYS = new Set([
   ...BOOTSTRAP_GATEWAY_KEYS.map(k => k.toLowerCase()),
   ...BOOTSTRAP_TOKEN_KEYS.map(k => k.toLowerCase()),
+  ...BOOTSTRAP_PROTOCOL_KEYS.map(k => k.toLowerCase()),
 ]);
 
 function _sanitizeBootstrapValue(v) {
@@ -2667,6 +2671,13 @@ function _readBootstrapParam(names, params, hashParams) {
     }
   }
   return { value: '', has: false, source: '' };
+}
+
+function _parseGatewayProtocolMode(value) {
+  const normalized = _sanitizeBootstrapValue(value).toLowerCase();
+  if (normalized === 'openclaw' || normalized === 'legacy' || normalized === 'auto') return normalized;
+  if (normalized === '1' || normalized === 'true') return 'openclaw';
+  return '';
 }
 
 function _parseGatewayCandidate(raw, fallbackToken = '') {
@@ -2750,37 +2761,39 @@ function _getAgentInstallConfig() {
   const tokenParam = _readBootstrapParam(tokenKeys, query, hashParams);
   const gatewayParam = _readBootstrapParam(gatewayKeys, query, hashParams);
   const agentParam = _readBootstrapParam(['agent', 'openclaw_agent', 'agent-link', 'agent-link-url'], query, hashParams);
+  const protocolMode = _parseGatewayProtocolMode(_readBootstrapParam(BOOTSTRAP_PROTOCOL_KEYS, query, hashParams).value);
+  const addMode = (payload) => ({ ...payload, protocolMode: protocolMode || '' });
 
   if (agentParam.has) {
-    return { ..._parseGatewayCandidate(agentParam.value, tokenParam.has ? tokenParam.value : ''), source: agentParam.source };
+    return addMode({ ..._parseGatewayCandidate(agentParam.value, tokenParam.has ? tokenParam.value : ''), source: agentParam.source });
   }
 
   if (hashRawOnly) {
     const parsed = _parseGatewayCandidate(hashRawOnly, tokenParam.has ? tokenParam.value : '');
-    if (parsed.gatewayUrl || parsed.hasToken) return { ...parsed, source: 'hash' };
+    if (parsed.gatewayUrl || parsed.hasToken) return addMode({ ...parsed, source: 'hash' });
   }
 
   if (gatewayParam.has) {
-    return { ..._parseGatewayCandidate(gatewayParam.value, tokenParam.has ? tokenParam.value : ''), source: gatewayParam.source };
+    return addMode({ ..._parseGatewayCandidate(gatewayParam.value, tokenParam.has ? tokenParam.value : ''), source: gatewayParam.source });
   }
 
   if (tokenParam.has) {
-    return {
+    return addMode({
       gatewayUrl: '',
       authToken: tokenParam.value || '',
       hasGateway: false,
       hasToken: true,
       source: tokenParam.source,
-    };
+    });
   }
 
-  return {
+  return addMode({
     gatewayUrl: '',
     authToken: '',
     hasGateway: false,
     hasToken: false,
     source: '',
-  };
+  });
 }
 
 function _stripBootstrapFromAddress(config) {
@@ -2824,8 +2837,9 @@ function _stripBootstrapFromAddress(config) {
 function _normalizeGatewayUrl(raw) {
   const rawValue = _sanitizeBootstrapValue(raw);
   if (!rawValue) return '';
-
-  if (/^wss?:\/\/[^/]+/i.test(rawValue)) return rawValue;
+  if (/^wss?:\/\/[^/]+/i.test(rawValue)) {
+    return rawValue;
+  }
   if (/^https?:\/\//i.test(rawValue)) {
     return rawValue.replace(/^https?:\/\//i, rawValue.startsWith('https:') ? 'wss://' : 'ws://');
   }
@@ -2842,14 +2856,43 @@ function _isGatewayUrl(value) {
   }
 }
 
+function _getGatewayConnectCandidates(raw) {
+  const normalized = _normalizeGatewayUrl(raw);
+  if (!_isGatewayUrl(normalized)) return [];
+  const candidates = [normalized];
+  try {
+    const parsed = new URL(normalized);
+    const swapped = parsed.protocol === 'ws:'
+      ? `wss://${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`
+      : parsed.protocol === 'wss:'
+        ? `ws://${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`
+        : '';
+    if (swapped && _isGatewayUrl(swapped) && swapped !== normalized) {
+      candidates.push(swapped);
+    }
+  } catch(e) {}
+  return candidates;
+}
+
 const OPENCLAW_PROTOCOL_MIN = 3;
 const OPENCLAW_PROTOCOL_MAX = 3;
+const OPENCLAW_PROTOCOL_FALLBACK = 2;
 const OPENCLAW_CONNECT_TIMEOUT_MS = 8000;
 const OPENCLAW_CONNECT_SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.pairing'];
 const OPENCLAW_CONNECT_SCOPES_STRICT = ['operator.read', 'operator.write'];
 const OPENCLAW_CONNECT_CAPS = [];
 const OPENCLAW_CONNECT_COMMANDS = [];
 const OPENCLAW_CONNECT_PERMISSIONS = {};
+const OPENCLAW_METHOD_ALIASES = {
+  agentsList: ['agents.list', 'agent.list', 'node.list', 'nodes.list', 'nodes'],
+  modelsList: ['models.list', 'model.list', 'models', 'model', 'models', 'config.get', 'node.models'],
+  sessionsList: ['sessions.list', 'session.list', 'sessions', 'session.list'],
+  sessionsHistory: ['sessions.history', 'sessions_history', 'chat.history', 'chat.get', 'session.get'],
+  chatHistory: ['chat.history', 'chat.logs', 'chat.get', 'messages'],
+  stateRequest: ['state.request', 'stateRequest', 'state.restore'],
+  stateSync: ['state.sync', 'stateSync'],
+  systemPresence: ['system-presence', 'system-presence.get', 'presence', 'presence.list', 'presence.get', 'presence_update'],
+};
 const OPENCLAW_EVENT_TYPES = new Set([
   'agent',
   'agent_comms',
@@ -2865,12 +2908,20 @@ const OPENCLAW_EVENT_TYPES = new Set([
   'hello_ok',
   'model',
   'model.list',
+  'model.get',
   'message',
   'meeting_message',
   'models.list',
   'models',
+  'node',
+  'node.list',
+  'nodes',
+  'nodes.list',
+  'nodes.describe',
   'presence',
   'presence_update',
+  'presence.list',
+  'presence.get',
   'routing_ack',
   'state.ack',
   'state_ack',
@@ -2881,6 +2932,7 @@ const OPENCLAW_EVENT_TYPES = new Set([
   'state_restore',
   'vault_request',
   'vault.request',
+  'vault_response',
 ]);
 
 let _gatewayProtocolPreference = 'auto';
@@ -2895,9 +2947,13 @@ let _openclawConnectChallengeCount = 0;
 let _openclawConnectChallenge = null;
 let _openclawPendingHelloApply = null;
 let _openclawDeviceKeyPairCache = null;
+let _openclawSessionsCache = [];
+let _openclawSessionAgentIndex = new Map();
+let _openclawHelloMethodSet = new Set();
 const OPENCLAW_DEVICE_ID_KEY = 'oc_openclaw_device_id';
 const OPENCLAW_DEVICE_KEYPAIR_KEY = 'oc_openclaw_device_keypair';
-const OPENCLAW_DEVICE_AUTH_VERSION = 'v1';
+const OPENCLAW_DEVICE_AUTH_VERSION_V1 = 'v1';
+const OPENCLAW_DEVICE_AUTH_VERSION_V2 = 'v2';
 const OPENCLAW_CLIENT_ID = 'openclaw-control-ui';
 const OPENCLAW_CLIENT_MODE = 'operator';
 const OPENCLAW_BOOTSTRAP_LOG_LIMIT = 60;
@@ -2960,6 +3016,27 @@ function _toBase64Url(bytes) {
     binary += String.fromCharCode.apply(null, Array.from(arr.subarray(i, i + chunkSize)));
   }
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function _setOpenclawMethodSetFromPayload(payload) {
+  const raw = _extractOpenclawPayload(payload);
+  const featureMethods = raw?.features?.methods || raw?.features || raw?.state?.features?.methods || raw?.result?.features?.methods;
+  if (!Array.isArray(featureMethods)) {
+    _openclawHelloMethodSet.clear();
+    return;
+  }
+
+  _openclawHelloMethodSet.clear();
+  featureMethods.forEach((name) => {
+    if (typeof name === 'string' && name.trim()) {
+      _openclawHelloMethodSet.add(name.trim());
+    }
+  });
+}
+
+function _isOpenclawMethodAdvertised(methodName) {
+  if (!_openclawHelloMethodSet || _openclawHelloMethodSet.size === 0) return true;
+  return _openclawHelloMethodSet.has(String(methodName || ''));
 }
 
 function _safeJsonParse(value) {
@@ -3056,11 +3133,14 @@ async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) 
   const base = _getOpenclawDeviceIdentity(challengePayload);
   const challengeData = _extractOpenclawPayload(challengePayload);
   const challengeTs = Number(challengeData?.ts || challengeData?.timestamp || challengeData?.signedAt);
-  const signedAt = Number.isFinite(challengeTs) ? challengeTs : Date.now();
+  const signedAt = Number.isFinite(challengeTs) ? Math.max(0, Math.floor(challengeTs)) : Math.floor(Date.now());
   const token = _sanitizeBootstrapToken(authToken || '');
   const nonce = _sanitizeBootstrapToken(challengeData?.nonce || challengeData?.nonceData || challengeData?.nonceStr || base?.nonce || '');
   const scopeList = Array.isArray(scopes) ? scopes : [];
-  const challengePayloadText = `${OPENCLAW_DEVICE_AUTH_VERSION}|${base?.id || 'device'}|${OPENCLAW_CLIENT_ID}|${OPENCLAW_CLIENT_MODE}|operator|${scopeList.join(',')}|${signedAt}|${token}|${nonce}`;
+  const hasChallengeNonce = !!nonce;
+  const version = hasChallengeNonce ? OPENCLAW_DEVICE_AUTH_VERSION_V2 : OPENCLAW_DEVICE_AUTH_VERSION_V1;
+  const normalizedScopes = scopeList.map((scope) => String(scope || '').trim()).filter(Boolean);
+  const challengePayloadText = `${version}|${base?.id || 'device'}|${OPENCLAW_CLIENT_ID}|${OPENCLAW_CLIENT_MODE}|operator|${normalizedScopes.join(',')}|${signedAt}|${token}${hasChallengeNonce ? `|${nonce}` : ''}`;
 
   const keyPair = await _ensureOpenclawDeviceKeyPair();
   if (!keyPair?.privateKey || !keyPair?.publicKeyString) return null;
@@ -3082,6 +3162,11 @@ async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) 
   } catch(e) {
     return null;
   }
+}
+
+function _openclawConnectErrorNeedsPairing(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return /pairing|device identity|device token|not authorized|unauthorized|invalid token|authorization|approval/.test(msg);
 }
 
 function _getOpenclawDeviceIdentity(challenge = null) {
@@ -3141,6 +3226,72 @@ function _extractOpenclawPayload(payload) {
   return payload?.payload ?? payload?.result ?? payload?.data ?? payload;
 }
 
+function _asOpenclawMethodList(methods) {
+  if (!methods) return [];
+  if (Array.isArray(methods)) return methods.filter(Boolean);
+  return [methods];
+}
+
+function _isMethodUnavailableError(err, method = '') {
+  const raw = typeof err?.message === 'string' ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  if (!raw) return false;
+  if (raw.includes('method not found') || raw.includes('unknown method') || raw.includes('unsupported method') || raw.includes('not supported')) return true;
+  if (method && raw.includes(`"${method}"`)) return true;
+  return false;
+}
+
+async function _sendOpenclawRequestAny(methodList, params = {}, timeoutMs = OPENCLAW_CONNECT_TIMEOUT_MS, options = {}) {
+  const methods = _asOpenclawMethodList(methodList);
+  const advertised = methods.filter((method) => _isOpenclawMethodAdvertised(method));
+  const candidates = advertised.length ? advertised : methods;
+  const allowFallback = options?.allowFallback !== false;
+  let lastErr = null;
+
+  for (const method of candidates) {
+    try {
+      const payload = await _sendOpenclawRequest(method, params, timeoutMs);
+      return { method, payload, usedMethod: method };
+    } catch (err) {
+      lastErr = err;
+      if (!allowFallback || !_isMethodUnavailableError(err, method)) {
+        throw err;
+      }
+      if (candidates[candidates.length - 1] === method) break;
+      console.warn(`[CommandCenter] OpenClaw method unavailable, trying fallback: ${method}`);
+    }
+  }
+
+  if (options?.required) throw lastErr || new Error('OpenClaw request failed: method unavailable');
+  return { method: candidates[0] || null, payload: null, usedMethod: null };
+}
+
+function _extractOpenclawTextValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => _extractOpenclawTextValue(part))
+      .filter(Boolean)
+      .join('')
+      .trim();
+  }
+  if (typeof value === 'object') {
+    return (
+      _extractOpenclawTextValue(value.text) ||
+      _extractOpenclawTextValue(value.message) ||
+      _extractOpenclawTextValue(value.output) ||
+      _extractOpenclawTextValue(value.delta) ||
+      _extractOpenclawTextValue(value.body) ||
+      _extractOpenclawTextValue(value.chunk) ||
+      _extractOpenclawTextValue(value.contentBlock?.text) ||
+      _extractOpenclawTextValue(value.value) ||
+      ''
+    );
+  }
+  return '';
+}
+
 function _extractOpenclawList(payload, keys) {
   if (Array.isArray(payload)) return payload;
   if (!payload || typeof payload !== 'object') return [];
@@ -3157,6 +3308,74 @@ function _extractOpenclawList(payload, keys) {
     }
   }
   return [];
+}
+
+function _normalizeOpenclawSessionsPayload(payload) {
+  const source = _extractOpenclawPayload(payload);
+  const raw = _extractOpenclawList(source, ['sessions', 'rows', 'sessionRows', 'items', 'history']);
+  if (!Array.isArray(raw)) return [];
+
+  const normalized = raw
+    .map((session) => {
+      if (!session || typeof session !== 'object') return null;
+      const sessionKey = session.sessionKey || session.session_id || session.key || session.id || session.sessionId;
+      let agentId = session.agentId || session.agent_id || session.agent || session.owner || session.nodeId;
+      if (!agentId && typeof sessionKey === 'string') {
+        const keyParts = sessionKey.split(':');
+        if (sessionKey === 'main' && state.agents?.[0]?.id) {
+          agentId = state.agents[0].id;
+        } else if (keyParts[0] === 'agent' && keyParts[1]) {
+          agentId = keyParts[1];
+        }
+      }
+      if (!sessionKey || !agentId) return null;
+      return {
+        sessionKey: String(sessionKey),
+        agentId: String(agentId),
+        scope: session.scope || session.kind || session.channel || 'main',
+        updatedAt: session.updatedAt || session.updated_at || session.ts || session.time || 0,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
+
+  _openclawSessionsCache = normalized;
+  _openclawSessionAgentIndex = new Map();
+  normalized.forEach((entry) => {
+    _openclawSessionAgentIndex.set(entry.sessionKey, entry.agentId);
+  });
+
+  return normalized;
+}
+
+function _pickOpenclawSessionKeyForAgent(sessions, agentId) {
+  if (!Array.isArray(sessions) || !agentId) return '';
+  const agentSessions = sessions.filter((session) => session.agentId === String(agentId));
+  if (!agentSessions.length) return '';
+
+  const direct = agentSessions.find((session) => session.scope === 'main' || session.scope === 'direct');
+  return (direct?.sessionKey) || agentSessions[0].sessionKey || '';
+}
+
+function _resolveOpenclawSessionAgentId(payload = {}, fallback = '') {
+  const direct = payload?.agentId || payload?.agent || payload?.from?.agentId || payload?.message?.agentId;
+  if (direct) return String(direct);
+  const sessionKey = payload?.sessionKey || payload?.session_id || payload?.session || payload?.thread;
+  if (sessionKey && _openclawSessionAgentIndex.has(String(sessionKey))) {
+    return _openclawSessionAgentIndex.get(String(sessionKey));
+  }
+  return fallback || '';
+}
+
+function _normalizeOpenclawTimestamp(value) {
+  if (!value) return ts();
+  const n = Number(value);
+  if (Number.isFinite(n)) {
+    if (n > 1e12) return n;
+    if (n > 1e9) return n * 1000;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : ts();
 }
 
 function _normalizeOpenclawEventName(raw) {
@@ -3215,14 +3434,46 @@ function _handleOpenclawResponse(msg) {
 
   clearTimeout(req.timer);
   _openclawReqs.delete(msg.id);
+  const body = _extractOpenclawPayload(msg);
   if (msg.ok === false) {
-    const reason = _extractOpenclawPayload(msg)?.error || msg.error || 'OpenClaw request failed';
+    const reason = body?.error || msg.error || 'OpenClaw request failed';
     const message = typeof reason === 'string' ? reason : reason?.message || 'OpenClaw request failed';
     req.reject(new Error(message));
     return true;
   }
-  req.resolve(_extractOpenclawPayload(msg));
+
+  if (req.method === 'state.request') {
+    const candidate = body?.state || body?.snapshot || body?.data?.state || body?.data?.snapshot || body?.payload?.state || body?.payload?.snapshot;
+    if (candidate && typeof candidate === 'object' && Object.keys(candidate).length) {
+      if (_isOpenclawStatePayload(candidate)) {
+        _storage.handleStateRestore({
+          state: candidate,
+          savedAt: candidate._savedAt || body._savedAt || body.savedAt || 0,
+        });
+      } else if (candidate.models || candidate.stateVersion || candidate.health || candidate.presence || candidate.agents) {
+        // Snapshot-like data from hello response without local dashboard state keys.
+        // Preserve gateway metadata and avoid clobbering.
+      }
+    } else if (candidate === null || candidate === undefined) {
+      _storage.handleStateRestore({});
+    }
+  }
+
+  if (req.method === 'state.sync' && body && typeof body === 'object') {
+    _storage.handleStateAck({
+      savedAt: body._savedAt || body.savedAt || Date.now(),
+      path: body.path || 'state/current.json',
+    });
+  }
+
+  req.resolve(body);
   return true;
+}
+
+function _isOpenclawStatePayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload._savedAt || payload._config || payload.tasks || payload.agents || payload.chatMessages) return true;
+  return STATE_KEYS.some((key) => Object.prototype.hasOwnProperty.call(payload, key));
 }
 
 async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null) {
@@ -3366,6 +3617,7 @@ function _startOpenclawBootstrap() {
 
   const connectTimeoutMs = Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000);
   const scopeAttempts = [OPENCLAW_CONNECT_SCOPES, OPENCLAW_CONNECT_SCOPES_STRICT];
+  _openclawHelloMethodSet.clear();
 
   const applyOpenclawHello = (payload = {}) => {
     if (_openclawConnectSession !== bootstrapSession || _openclawHelloAt) return;
@@ -3389,6 +3641,12 @@ function _startOpenclawBootstrap() {
       state.gatewayModels = mappedFromSnapshot;
       _safeSave('oc_gatewayModels', state.gatewayModels);
     }
+    if (_isOpenclawStatePayload(snapshot)) {
+      _storage.handleStateRestore({
+        state: snapshot,
+        savedAt: snapshot._savedAt || snapshot.savedAt || body.savedAt || payload.savedAt || 0,
+      });
+    }
 
     _gatewayProtocolRuntimeMode = 'openclaw';
     _setGatewayProtocolMode('openclaw');
@@ -3402,25 +3660,19 @@ function _startOpenclawBootstrap() {
     _reconnectAttempt = 0;
     console.log('[CommandCenter] OpenClaw handshake OK', payload);
 
+    _setOpenclawMethodSetFromPayload(body || payload);
     const normalizeAgentsFromResponse = (data) => {
       const merged = _normalizeOpenclawAgentsPayload(data);
       if (!merged.length) return;
       state.agents = merged;
-      state.agents.forEach(a => { state.chatMessages[a.id] = state.chatMessages[a.id] || []; });
+      state.agents.forEach((a) => {
+        state.chatMessages[a.id] = state.chatMessages[a.id] || [];
+      });
       renderAll();
       _safeSave('oc_agents', state.agents);
       state.activeChat = state.agents[0]?.id || state.activeChat;
+      state._lastActiveGatewaySync = Date.now();
     };
-    _sendOpenclawRequest('agents.list')
-      .then((data) => {
-        normalizeAgentsFromResponse(data);
-      })
-      .catch(() => _sendOpenclawRequest('agent.list').then((data) => {
-        normalizeAgentsFromResponse(data);
-      }))
-      .catch((err) => {
-        console.warn('[CommandCenter] agents list fetch failed:', err.message);
-      });
 
     const normalizeModelsFromResponse = (payload) => {
       const mapped = _normalizeOpenclawModelsPayload(payload);
@@ -3429,55 +3681,114 @@ function _startOpenclawBootstrap() {
       _safeSave('oc_gatewayModels', state.gatewayModels);
       _showToast({ text: `Loaded ${mapped.length} models from OpenClaw gateway`, level:'success', ts: ts() });
     };
-    _sendOpenclawRequest('models.list')
-      .then((data) => {
-        normalizeModelsFromResponse(data);
-      })
-      .catch(() => _sendOpenclawRequest('model.list'))
-      .then((data) => {
-        if (data) normalizeModelsFromResponse(data);
-      })
-      .catch(() => _sendOpenclawRequest('models'))
-      .then((data) => {
-        if (data) normalizeModelsFromResponse(data);
-      })
-      .catch((err) => {
+
+    const syncAgents = async () => {
+      try {
+        const { payload: agentPayload } = await _sendOpenclawRequestAny(
+          OPENCLAW_METHOD_ALIASES.agentsList,
+          {},
+          OPENCLAW_CONNECT_TIMEOUT_MS,
+          { allowFallback: true }
+        );
+        normalizeAgentsFromResponse(agentPayload);
+      } catch (err) {
+        console.warn('[CommandCenter] agents list fetch failed:', err.message);
+      }
+    };
+
+    const syncModels = async () => {
+      try {
+        const { payload: modelPayload } = await _sendOpenclawRequestAny(
+          OPENCLAW_METHOD_ALIASES.modelsList,
+          {},
+          OPENCLAW_CONNECT_TIMEOUT_MS,
+          { allowFallback: true }
+        );
+        normalizeModelsFromResponse(modelPayload);
+      } catch (err) {
         console.warn('[CommandCenter] models load failed:', err.message);
-      });
+      }
+    };
 
-    _sendOpenclawRequest('system-presence').then((data) => {
-      const list = data?.presence || data?.nodes || [];
-      if (Array.isArray(list)) {
-        list.forEach(item => {
-          if (item && item.agentId && item.status) {
-            state.agentStatus[item.agentId] = item.status;
+    const syncPresence = async () => {
+      try {
+        const { payload: presencePayload } = await _sendOpenclawRequestAny(
+          OPENCLAW_METHOD_ALIASES.systemPresence,
+          {},
+          OPENCLAW_CONNECT_TIMEOUT_MS,
+          { allowFallback: true }
+        );
+        const list = _extractOpenclawList(presencePayload, ['presence', 'nodes', 'presenceList', 'entries', 'rows', 'items']);
+        if (Array.isArray(list)) {
+          list.forEach((item) => {
+            if (item && item.agentId && item.status) {
+              state.agentStatus[item.agentId] = item.status;
+            }
+          });
+          renderAgentPills();
+          renderOrgChart();
+        }
+      } catch (err) {
+        // optional on older gateway implementations
+      }
+    };
+
+    const syncAgentChats = async () => {
+      let sessions = [];
+      try {
+        const { payload: sessionsPayload } = await _sendOpenclawRequestAny(
+          OPENCLAW_METHOD_ALIASES.sessionsList,
+          { limit: 500 },
+          OPENCLAW_CONNECT_TIMEOUT_MS,
+          { allowFallback: true }
+        );
+        if (sessionsPayload) {
+          sessions = _normalizeOpenclawSessionsPayload(sessionsPayload);
+        }
+      } catch (err) {
+        sessions = [];
+      }
+
+      const syncOne = async (agent) => {
+        const preferredSession = _pickOpenclawSessionKeyForAgent(sessions, agent.id) || state.chatSessionKey || 'main';
+        const attempts = [
+          [OPENCLAW_METHOD_ALIASES.sessionsHistory, { sessionKey: preferredSession, limit: 250 }],
+          [OPENCLAW_METHOD_ALIASES.chatHistory, { agentId: agent.id, sessionKey: preferredSession, limit: 250 }],
+        ];
+
+        for (const attempt of attempts) {
+          try {
+            const [methods, params] = attempt;
+            const { payload: historyPayload } = await _sendOpenclawRequestAny(methods, params, OPENCLAW_CONNECT_TIMEOUT_MS, { allowFallback: true });
+            if (!historyPayload) continue;
+            const records = _normalizeOpenclawChatHistory(historyPayload, agent.id);
+            if (records.length) {
+              state.chatMessages[agent.id] = _mergeOpenclawChatHistory(agent.id, records);
+            }
+            return;
+          } catch (err) {
+            if (!_isMethodUnavailableError(err, attempt[0]?.[0])) break;
           }
-        });
-        renderAgentPills();
-        renderOrgChart();
-      }
-    }).catch(() => {});
+        }
+      };
 
-    // Pull latest chat history for each agent in the OpenClaw session model
-    const sessionKey = state.chatSessionKey || 'main';
-    Promise.all(state.agents.map((agent) => _sendOpenclawRequest('chat.history', {
-      agentId: agent.id,
-      sessionKey,
-      limit: 200,
-    }).then((payload = {}) => {
-      const records = _normalizeOpenclawChatHistory(payload, agent.id);
-      if (records.length) {
-        state.chatMessages[agent.id] = _mergeOpenclawChatHistory(agent.id, records);
-      }
-    }).catch(() => {}))).finally(() => {
+      await Promise.all(state.agents.map((agent) => syncOne(agent)));
       _trimChat();
       _saveChatMessages();
       renderChat();
-    });
+    };
 
-    _syncAllRouting('reconnect');
-    _storage.requestStateFromGateway();
-    _syncVaultToGateway();
+    (async () => {
+      try {
+        await Promise.allSettled([syncAgents(), syncModels(), syncPresence(), syncAgentChats()]);
+      } catch (err) {
+        console.warn('[CommandCenter] OpenClaw bootstrap data sync had errors:', err.message);
+      }
+
+      _syncAllRouting('reconnect');
+      _syncVaultToGateway();
+      _storage.requestStateFromGateway();
+    })();
   };
 
   _openclawPendingHelloApply = applyOpenclawHello;
@@ -3508,7 +3819,8 @@ function _startOpenclawBootstrap() {
       console.warn('[CommandCenter] OpenClaw connect failed:', err.message);
       state.connected = false;
       _openclawHelloAt = 0;
-      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled;
+      const needsPairing = _openclawConnectErrorNeedsPairing(err);
+      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled && !needsPairing;
       if (_openclawConnectSession === bootstrapSession) {
         _openclawPendingHelloApply = null;
       }
@@ -3524,7 +3836,17 @@ function _startOpenclawBootstrap() {
           connectGateway();
         }, 250);
       } else {
-        if (el) { el.className = 'disconnected'; el.title = `Gateway: connect failed (${err.message})`; }
+        if (el) {
+          el.className = 'disconnected';
+          el.title = needsPairing ? 'Gateway: pairing/auth required' : `Gateway: connect failed (${err.message})`;
+        }
+        if (needsPairing) {
+          _showToast({
+            text: 'Gateway requires approval on the host (approve this device in OpenClaw, then reconnect).',
+            level: 'error',
+            ts: ts(),
+          });
+        }
       }
     })
     .finally(() => {
@@ -3589,16 +3911,25 @@ function _normalizeChatActor(msg) {
 }
 
 function _normalizeOpenclawChatHistory(payload, agentId) {
-  const source = payload?.messages || payload?.history || payload?.transcript || [];
+  const source = _extractOpenclawList(payload, ['messages', 'history', 'transcript', 'rows', 'items']);
   if (!Array.isArray(source)) return [];
   return source.map((item) => {
-    const text = item.text || item.content || item.message || item.output || item.delta || item.contentBlock?.text || item.body;
+    if (!item || typeof item !== 'object') return null;
+    const text = _extractOpenclawTextValue(item.text || item.content || item.message || item.output || item.delta || item.body || item.contentBlock?.text);
     if (!text) return null;
+    const resolvedAgentId = _resolveOpenclawSessionAgentId(item, agentId);
+    if (!resolvedAgentId) return null;
+    const actor = _normalizeChatActor({
+      role: item.role,
+      sender: item.sender,
+      type: item.type,
+    }) || _normalizeChatActor(item);
     return {
-      from: _normalizeChatActor(item),
+      from: actor,
       text: String(text),
-      ts: item.ts || item.timestamp || item.time || item.createdAt || item.updatedAt || ts(),
-      agentId: item.agentId || agentId,
+      ts: _normalizeOpenclawTimestamp(item.ts || item.timestamp || item.time || item.createdAt || item.updatedAt || item.sentAt || item.receivedAt || item.timeMs || ts()),
+      agentId: resolvedAgentId,
+      sessionKey: item.sessionKey || item.session_id || item.session || item.thread || null,
     };
   }).filter(Boolean);
 }
@@ -3647,6 +3978,23 @@ function _normalizeOpenclawEventPayload(payload) {
   if (!event) return { event: '', data: source, handled: false };
   if (!OPENCLAW_EVENT_TYPES.has(event)) return { event, data: source, handled: false };
   return { event, data: source, handled: true };
+}
+
+function _extractOpenclawPresencePayload(payload) {
+  const source = _extractOpenclawList(payload, ['presence', 'nodes', 'presenceList', 'entries', 'rows', 'items']);
+  if (!Array.isArray(source)) return [];
+  return source
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const agentId = item.agentId || item.agent || item.nodeId || item.deviceId || item.id;
+      const status = item.status || item.state || item.role || item.mode || 'offline';
+      if (!agentId) return null;
+      return {
+        agentId,
+        status,
+      };
+    })
+    .filter(Boolean);
 }
 
 function _handleOpenclawEventMessage(msg) {
@@ -3981,6 +4329,12 @@ function _setGatewayStatusDisconnected(msg, el) {
 const __agentInstallConfig = _getAgentInstallConfig();
 if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
   _stripBootstrapFromAddress(__agentInstallConfig);
+}
+
+if (__agentInstallConfig.protocolMode) {
+  _setGatewayProtocolMode(__agentInstallConfig.protocolMode);
+} else if (__agentInstallConfig.gatewayUrl || __agentInstallConfig.hasToken) {
+  _setGatewayProtocolMode('openclaw');
 }
 
 if (__agentInstallConfig.gatewayUrl) {
@@ -5256,9 +5610,13 @@ $('#add-agent-btn')?.addEventListener('click', () => _openAgentModal());
 
 // ── GATEWAY WEBSOCKET ───────────────────────────────
 let _reconnectAttempt = 0;
+let _gatewayConnectGeneration = 0;
+let _gatewayConnectCandidates = [];
+let _gatewayConnectAttemptIndex = 0;
+
 function connectGateway() {
-  const normalizedGatewayUrl = _normalizeGatewayUrl(state.gatewayUrl);
-  if (!_isGatewayUrl(normalizedGatewayUrl)) {
+  const candidates = _getGatewayConnectCandidates(state.gatewayUrl);
+  if (!candidates.length) {
     const el = $('#conn-status');
     if (el) {
       el.className = 'disconnected';
@@ -5267,88 +5625,141 @@ function connectGateway() {
     console.warn('[CommandCenter] Invalid gateway URL:', state.gatewayUrl);
     return;
   }
+  const normalizedGatewayUrl = candidates[0];
   if (state.gatewayUrl !== normalizedGatewayUrl) {
     state.gatewayUrl = normalizedGatewayUrl;
     _safeSave('oc_gw_url', state.gatewayUrl);
   }
 
-  if (state.ws) { state.ws.close(); state.ws = null; }
+  if (state.ws) {
+    try { state.ws.close(); } catch(e) {}
+    state.ws = null;
+  }
+
   const el = $('#conn-status');
-  el.className = 'connecting'; el.title = 'Connecting...';
   _setGatewayStatusDisconnected('Gateway: disconnected', el);
   const preferredMode = _resolveConnectModeForCurrentState();
   _gatewayProtocolRuntimeMode = preferredMode;
+  const generation = ++_gatewayConnectGeneration;
+  _gatewayConnectCandidates = candidates;
+  _gatewayConnectAttemptIndex = 0;
+  const maxAttempts = candidates.length;
 
-  try {
-    const ws = new WebSocket(normalizedGatewayUrl);
-    state.ws = ws;
+  const tryConnect = (attemptIndex) => {
+    if (generation !== _gatewayConnectGeneration || state.connected) return;
+    const candidate = _gatewayConnectCandidates[Math.min(attemptIndex, maxAttempts - 1)];
+    if (!candidate) return;
 
-    ws.onopen = () => {
-      el.className = 'connecting';
-      el.title = `Connecting... (${preferredMode})`;
-      _clearOpenclawRequests('reconnect-reset');
+    _gatewayConnectAttemptIndex = attemptIndex;
+    if (attemptIndex > 0) {
+      const attemptName = candidate.startsWith('wss') ? 'wss' : 'ws';
+      _showToast({
+        text: `Retrying gateway transport (${attemptName})`,
+        level: 'info',
+        ts: ts(),
+      });
+    }
 
-      if (_gatewayNegotiationTimer) {
-        clearTimeout(_gatewayNegotiationTimer);
-        _gatewayNegotiationTimer = null;
-      }
+    const nextLabel = candidate.startsWith('wss') ? 'wss' : 'ws';
+    el.className = 'connecting';
+    el.title = `Connecting... (${preferredMode}, ${nextLabel})`;
 
-      console.log('[CommandCenter] Gateway socket open, bootstrapping', preferredMode);
+    try {
+      const ws = new WebSocket(candidate);
+      state.ws = ws;
+      ws.onopen = () => {
+        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        el.className = 'connecting';
+        el.title = `Connecting... (${preferredMode})`;
+        _clearOpenclawRequests('reconnect-reset');
 
-      if (preferredMode === 'legacy') {
-        _startLegacyBootstrap();
-      } else {
-        _startOpenclawBootstrap();
-        _gatewayNegotiationTimer = setTimeout(() => {
-          _gatewayProtocolRuntimeMode = 'openclaw';
-          if (_gatewayProtocolPreference === 'openclaw' && _isOpenclawConnectedMode() && !state.connected) {
+        if (_gatewayNegotiationTimer) {
+          clearTimeout(_gatewayNegotiationTimer);
+          _gatewayNegotiationTimer = null;
+        }
+
+        console.log('[CommandCenter] Gateway socket open, bootstrapping', preferredMode);
+
+        if (preferredMode === 'legacy') {
+          _startLegacyBootstrap();
+        } else {
+          _startOpenclawBootstrap();
+          _gatewayNegotiationTimer = setTimeout(() => {
             _gatewayProtocolRuntimeMode = 'openclaw';
-          }
-        }, Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 4500));
-      }
-    };
+            if (_gatewayProtocolPreference === 'openclaw' && _isOpenclawConnectedMode() && !state.connected) {
+              _gatewayProtocolRuntimeMode = 'openclaw';
+            }
+          }, Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 4500));
+        }
+      };
 
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        handleGatewayMessage(msg);
-      } catch(e) { console.warn('[CommandCenter] Parse error:', e); }
-    };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          handleGatewayMessage(msg);
+        } catch(e) { console.warn('[CommandCenter] Parse error:', e); }
+      };
 
-    ws.onclose = (evt) => {
-      _clearOpenclawRequests('close');
-      if (_gatewayNegotiationTimer) {
-        clearTimeout(_gatewayNegotiationTimer);
-        _gatewayNegotiationTimer = null;
-      }
-      state.connected = false;
-      _gatewayProtocolRuntimeMode = _gatewayProtocolPreference;
-      _storage.handleGatewayDisconnect();
-      el.className = 'disconnected'; el.title = 'Gateway: disconnected';
-      const closeInfo = evt && (evt.reason || evt.code)
-        ? ` (${evt.code || 'no-code'}: ${evt.reason || 'no reason'})`
-        : '';
-      console.log('[CommandCenter] Disconnected', closeInfo);
-      // Exponential backoff reconnect: 1s, 2s, 4s, 8s, 16s, 30s max
+      ws.onclose = (evt) => {
+        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        _clearOpenclawRequests('close');
+        if (_gatewayNegotiationTimer) {
+          clearTimeout(_gatewayNegotiationTimer);
+          _gatewayNegotiationTimer = null;
+        }
+        state.connected = false;
+        _gatewayProtocolRuntimeMode = _gatewayProtocolPreference;
+        _storage.handleGatewayDisconnect();
+
+        el.className = 'disconnected';
+        const closeInfo = evt && (evt.reason || evt.code)
+          ? ` (${evt.code || 'no-code'}: ${evt.reason || 'no reason'})`
+          : '';
+        console.log('[CommandCenter] Disconnected', closeInfo);
+
+        const reason = String(evt?.reason || '').toLowerCase();
+        const code = evt?.code;
+        const isPairingRequired = code === 1008 || reason.includes('pairing') || reason.includes('authorized') || reason.includes('not authorized') || reason.includes('invalid token');
+        const isRetryableTransportClose = !isPairingRequired && (code === 1006 || code === 1001 || code === 0);
+        const nextAttemptIndex = attemptIndex + 1;
+        if (isRetryableTransportClose && nextAttemptIndex < maxAttempts) {
+          el.title = `Gateway: transport retry (${nextAttemptIndex + 1}/${maxAttempts})`;
+          setTimeout(() => {
+            if (generation === _gatewayConnectGeneration && !state.connected) {
+              tryConnect(nextAttemptIndex);
+            }
+          }, 250);
+          return;
+        }
+
+        _reconnectAttempt = Math.min((_reconnectAttempt || 0) + 1, 6);
+        const baseDelay = Math.min(1000 * Math.pow(2, _reconnectAttempt - 1), 30000);
+        const jitter = Math.random() * 1000;
+        const delay = baseDelay + jitter;
+        console.log(`[CommandCenter] Reconnecting in ${Math.round(delay/1000)}s (attempt ${_reconnectAttempt})`);
+        el.title = isPairingRequired
+          ? `Gateway: disconnected${closeInfo} (pairing/auth required)`
+          : `Gateway: reconnecting in ${Math.round(delay/1000)}s...`;
+        setTimeout(() => { if (!state.connected && generation === _gatewayConnectGeneration) connectGateway(); }, delay);
+      };
+
+      ws.onerror = () => {
+        if (generation !== _gatewayConnectGeneration || state.connected) return;
+        el.className = 'disconnected';
+        el.title = 'Gateway: error';
+      };
+    } catch(e) {
+      if (generation !== _gatewayConnectGeneration) return;
+      el.className = 'disconnected';
+      el.title = `Gateway: failed (${e?.message || 'unknown error'})`;
       _reconnectAttempt = Math.min((_reconnectAttempt || 0) + 1, 6);
-      const baseDelay = Math.min(1000 * Math.pow(2, _reconnectAttempt - 1), 30000);
-      const jitter = Math.random() * 1000;
-      const delay = baseDelay + jitter;
-      console.log(`[CommandCenter] Reconnecting in ${Math.round(delay/1000)}s (attempt ${_reconnectAttempt})`);
-      const isPairingRequired = evt && (evt.code === 1008 || (evt.reason || '').toLowerCase().includes('pairing') || (evt.reason || '').toLowerCase().includes('authorized'));
-      el.title = isPairingRequired
-        ? `Gateway: disconnected${closeInfo} (pairing/auth required)`
-        : `Gateway: reconnecting in ${Math.round(delay/1000)}s...`;
-      setTimeout(() => { if (!state.connected) connectGateway(); }, delay);
-    };
+      setTimeout(() => {
+        if (!state.connected && generation === _gatewayConnectGeneration) connectGateway();
+      }, 1000);
+    }
+  };
 
-    ws.onerror = () => {
-      el.className = 'disconnected'; el.title = 'Gateway: error';
-    };
-  } catch(e) {
-    el.className = 'disconnected'; el.title = 'Gateway: failed';
-    console.error('[CommandCenter] WS error:', e);
-  }
+  tryConnect(0);
 }
 
 function handleGatewayMessage(msg) {
