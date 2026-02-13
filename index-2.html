@@ -2874,6 +2874,20 @@ function _getGatewayConnectCandidates(raw) {
   return candidates;
 }
 
+function _extractAuthTokenFromGatewayUrl(raw) {
+  const normalized = _normalizeGatewayUrl(raw);
+  if (!_isGatewayUrl(normalized)) return '';
+  try {
+    const parsed = new URL(normalized);
+    const keys = ['token', 'auth', 'auth_token', 'agent_token', 'gateway_token'];
+    for (const key of keys) {
+      const value = _sanitizeBootstrapToken(parsed.searchParams.get(key) || '');
+      if (value) return value;
+    }
+  } catch (e) {}
+  return '';
+}
+
 const OPENCLAW_PROTOCOL_MIN = 3;
 const OPENCLAW_PROTOCOL_MAX = 3;
 const OPENCLAW_PROTOCOL_FALLBACK = 2;
@@ -2947,6 +2961,7 @@ let _openclawConnectChallengeCount = 0;
 let _openclawConnectChallenge = null;
 let _openclawPendingHelloApply = null;
 let _openclawDeviceKeyPairCache = null;
+let _openclawLastConnectHasDevice = false;
 let _openclawSessionsCache = [];
 let _openclawSessionAgentIndex = new Map();
 let _openclawHelloMethodSet = new Set();
@@ -3602,7 +3617,8 @@ async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, ch
     userAgent: `openclaw-control-ui (${navigator.userAgent || 'web'})`,
   };
   const signedDevice = await _buildOpenclawDevicePayload(challengeData, scopes, authPayload?.token || '', normalizedMode);
-  if (signedDevice?.id && signedDevice?.publicKey && signedDevice?.signature) {
+  _openclawLastConnectHasDevice = !!(signedDevice?.id && signedDevice?.publicKey && signedDevice?.signature);
+  if (_openclawLastConnectHasDevice) {
     payload.device = signedDevice;
   } else if (state.authToken && window.isSecureContext === true) {
     _recordOpenclawBootstrap({
@@ -4136,8 +4152,16 @@ function _handleOpenclawEventMessage(msg) {
   if (event === 'connect.challenge' || event === 'connect.challenge_ack') {
     if (_openclawHelloAt === 0 && _openclawConnectSession) {
       _openclawConnectChallengeCount = (_openclawConnectChallengeCount || 0) + 1;
+      _openclawConnectChallenge = _extractOpenclawPayload(data) || data;
+      if (!_openclawLastConnectHasDevice) {
+        _recordOpenclawBootstrap({
+          level: 'info',
+          area: 'openclaw.connect',
+          message: 'Received connect.challenge without device-signing support; waiting for connect response (token-only mode).',
+        });
+        return true;
+      }
       if (_openclawConnectChallengeCount <= 3 && state.ws && state.ws.readyState === WebSocket.OPEN) {
-        _openclawConnectChallenge = _extractOpenclawPayload(data) || data;
         const apply = () => typeof _openclawPendingHelloApply === 'function' ? _openclawPendingHelloApply : null;
         _connectOpenclawSession(
             OPENCLAW_CONNECT_SCOPES,
@@ -4499,6 +4523,13 @@ if (__agentInstallConfig.gatewayUrl) {
   if (normalizedGateway) {
     state.gatewayUrl = normalizedGateway;
     try { localStorage.setItem('oc_gw_url', state.gatewayUrl); } catch(e) {}
+    if (!state.authToken) {
+      const tokenFromGateway = _extractAuthTokenFromGatewayUrl(state.gatewayUrl);
+      if (tokenFromGateway) {
+        state.authToken = tokenFromGateway;
+        try { localStorage.setItem('oc_gw_token', state.authToken); } catch(e) {}
+      }
+    }
   }
 }
 if (__agentInstallConfig.hasToken) {
@@ -5788,6 +5819,13 @@ let _gatewayConnectCandidates = [];
 let _gatewayConnectAttemptIndex = 0;
 
 function connectGateway() {
+  if (!state.authToken) {
+    const tokenFromGateway = _extractAuthTokenFromGatewayUrl(state.gatewayUrl);
+    if (tokenFromGateway) {
+      state.authToken = tokenFromGateway;
+      _safeSave('oc_gw_token', state.authToken);
+    }
+  }
   const candidates = _getGatewayConnectCandidates(state.gatewayUrl);
   if (!candidates.length) {
     const el = $('#conn-status');
@@ -5897,6 +5935,20 @@ function connectGateway() {
         const code = evt?.code;
         const isPairingRequired = code === 1008 || reason.includes('pairing') || reason.includes('authorized') || reason.includes('not authorized') || reason.includes('invalid token');
         const isOriginBlocked = reason.includes('origin not allowed') || reason.includes('allowedorigins') || reason.includes('allowed origins');
+        const legacyRejected = _gatewayProtocolRuntimeMode === 'legacy' && code === 1008 && reason.includes('invalid request frame');
+        if (legacyRejected) {
+          _setGatewayProtocolMode('openclaw');
+          el.title = 'Gateway: legacy unsupported, switching to OpenClaw';
+          _showToast({
+            text: 'Gateway no longer accepts legacy handshake. Switched to OpenClaw protocol.',
+            level: 'info',
+            ts: ts(),
+          });
+          setTimeout(() => {
+            if (!state.connected && generation === _gatewayConnectGeneration) connectGateway();
+          }, 150);
+          return;
+        }
         if (isOriginBlocked) {
           el.title = `Gateway: origin not allowed${closeInfo}`;
           return;
