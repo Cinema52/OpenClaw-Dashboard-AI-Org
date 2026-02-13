@@ -2847,6 +2847,9 @@ const OPENCLAW_PROTOCOL_MAX = 3;
 const OPENCLAW_CONNECT_TIMEOUT_MS = 8000;
 const OPENCLAW_CONNECT_SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.pairing'];
 const OPENCLAW_CONNECT_SCOPES_STRICT = ['operator.read', 'operator.write'];
+const OPENCLAW_CONNECT_CAPS = [];
+const OPENCLAW_CONNECT_COMMANDS = [];
+const OPENCLAW_CONNECT_PERMISSIONS = {};
 const OPENCLAW_EVENT_TYPES = new Set([
   'agent',
   'agent_comms',
@@ -2923,6 +2926,12 @@ function _setGatewayProtocolMode(mode) {
   _gatewayProtocolPreference = normalized;
   _gatewayProtocolRuntimeMode = normalized;
   try { localStorage.setItem('oc_gateway_protocol_mode', normalized); } catch(e) {}
+}
+
+function _resolveConnectModeForCurrentState() {
+  const explicit = _gatewayProtocolPreference === 'auto' ? 'openclaw' : _gatewayProtocolPreference;
+  if (state && state.authToken && explicit === 'legacy') return 'openclaw';
+  return explicit;
 }
 
 function _clearOpenclawRequests(reason = 'disconnect') {
@@ -3114,7 +3123,11 @@ function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challeng
     },
     role: 'operator',
     scopes,
+    caps: OPENCLAW_CONNECT_CAPS,
+    commands: OPENCLAW_CONNECT_COMMANDS,
+    permissions: OPENCLAW_CONNECT_PERMISSIONS,
     locale: navigator.language || 'en-US',
+    userAgent: `openclaw-control-ui (${navigator.userAgent || 'web'})`,
   };
   payload.device = _getOpenclawDeviceIdentity(challengeData);
 
@@ -3127,8 +3140,20 @@ function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challeng
 }
 
 function _normalizeOpenclawAgentsPayload(payload) {
-  const input = _extractOpenclawList(payload, ['agents', 'nodes', 'agentList', 'nodeList', 'items']);
-  if (!Array.isArray(input)) return [];
+  let input = _extractOpenclawList(payload, ['agents', 'nodes', 'agentList', 'nodeList', 'items']);
+  if (!Array.isArray(input)) {
+    if (input && typeof input === 'object') {
+      input = Object.values(input);
+    } else {
+      const source = payload && typeof payload === 'object' ? (payload.agents || payload.nodes || payload.agentList || payload.nodeList || payload.items) : null;
+      if (source && typeof source === 'object' && !Array.isArray(source)) {
+        input = Object.values(source);
+      } else {
+        return [];
+      }
+    }
+  }
+
   const mapped = [];
   input.forEach(agent => {
     if (typeof agent === 'string' && agent.trim()) {
@@ -3164,26 +3189,28 @@ function _normalizeOpenclawAgentsPayload(payload) {
 
 function _normalizeOpenclawModelsPayload(payload) {
   let input = _extractOpenclawList(payload, ['models', 'modelList', 'model_list', 'items', 'availableModels', 'list']);
-  if (!Array.isArray(input)) return [];
-  return input
-    .filter(item => item && typeof item === 'object')
-    .map(item => ({
-      id: item.id || item.model || item.name,
-      name: item.name || item.id || item.model || item.label,
-      provider: item.provider || item.source || item.vendor || 'Gateway',
-      tier: item.tier || item.quality || 'available',
-      size: item.size || null,
-    }))
-    .concat(
-      input.filter(item => typeof item === 'string').map((item) => ({
-        id: item,
-        name: item,
-        provider: 'Gateway',
-        tier: 'available',
-        size: null,
-      }))
-    )
-    .filter(m => m.id && m.name);
+  if (!Array.isArray(input)) {
+    if (input && typeof input === 'object') {
+      input = Object.values(input);
+    } else {
+      return [];
+    }
+  }
+  const normalized = input
+    .map(item => {
+      if (typeof item === 'string') return { id: item, name: item, provider: 'Gateway', tier: 'available', size: null };
+      if (!item || typeof item !== 'object') return null;
+      return {
+        id: item.id || item.model || item.name,
+        name: item.name || item.id || item.model || item.label,
+        provider: item.provider || item.source || item.vendor || 'Gateway',
+        tier: item.tier || item.quality || 'available',
+        size: item.size || null,
+      };
+    })
+    .filter(Boolean);
+
+  return normalized;
 }
 
 function _startOpenclawBootstrap() {
@@ -5115,7 +5142,7 @@ function connectGateway() {
   const el = $('#conn-status');
   el.className = 'connecting'; el.title = 'Connecting...';
   _setGatewayStatusDisconnected('Gateway: disconnected', el);
-  const preferredMode = _gatewayProtocolPreference === 'auto' ? 'openclaw' : _gatewayProtocolPreference;
+  const preferredMode = _resolveConnectModeForCurrentState();
   _gatewayProtocolRuntimeMode = preferredMode;
 
   try {
@@ -5154,7 +5181,7 @@ function connectGateway() {
       } catch(e) { console.warn('[CommandCenter] Parse error:', e); }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (evt) => {
       _clearOpenclawRequests('close');
       if (_gatewayNegotiationTimer) {
         clearTimeout(_gatewayNegotiationTimer);
@@ -5164,14 +5191,20 @@ function connectGateway() {
       _gatewayProtocolRuntimeMode = _gatewayProtocolPreference;
       _storage.handleGatewayDisconnect();
       el.className = 'disconnected'; el.title = 'Gateway: disconnected';
-      console.log('[CommandCenter] Disconnected');
+      const closeInfo = evt && (evt.reason || evt.code)
+        ? ` (${evt.code || 'no-code'}: ${evt.reason || 'no reason'})`
+        : '';
+      console.log('[CommandCenter] Disconnected', closeInfo);
       // Exponential backoff reconnect: 1s, 2s, 4s, 8s, 16s, 30s max
       _reconnectAttempt = Math.min((_reconnectAttempt || 0) + 1, 6);
       const baseDelay = Math.min(1000 * Math.pow(2, _reconnectAttempt - 1), 30000);
       const jitter = Math.random() * 1000;
       const delay = baseDelay + jitter;
       console.log(`[CommandCenter] Reconnecting in ${Math.round(delay/1000)}s (attempt ${_reconnectAttempt})`);
-      el.title = `Gateway: reconnecting in ${Math.round(delay/1000)}s...`;
+      const isPairingRequired = evt && (evt.code === 1008 || (evt.reason || '').toLowerCase().includes('pairing') || (evt.reason || '').toLowerCase().includes('authorized'));
+      el.title = isPairingRequired
+        ? `Gateway: disconnected${closeInfo} (pairing/auth required)`
+        : `Gateway: reconnecting in ${Math.round(delay/1000)}s...`;
       setTimeout(() => { if (!state.connected) connectGateway(); }, delay);
     };
 
