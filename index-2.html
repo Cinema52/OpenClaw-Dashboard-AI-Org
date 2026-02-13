@@ -4211,6 +4211,31 @@ function _handleOpenclawEventMessage(msg) {
     if (state.activeChat === normalized.agentId && state.activeView === 'chat') {
       renderChat();
     }
+    // If a briefing is active, mirror tagged participant messages into the meeting transcript.
+    if (
+      state.meeting?.active &&
+      normalized.from === 'agent' &&
+      Array.isArray(state.meeting.participants) &&
+      state.meeting.participants.includes(normalized.agentId)
+    ) {
+      const tag = state.meeting.tag ? `[${state.meeting.tag}]` : '';
+      const text = String(normalized.text || '');
+      if (!tag || text.includes(tag)) {
+        const stripped = tag ? text.replace(tag, '').trim() : text.trim();
+        const upper = stripped.toUpperCase();
+        const type = upper.startsWith('ACTION ITEM:') || upper.startsWith('ACTION:')
+          ? 'action-item'
+          : upper.startsWith('DECISION:')
+            ? 'decision'
+            : upper.startsWith('QUESTION:')
+              ? 'question'
+              : 'message';
+        const last = state.meeting.messages[state.meeting.messages.length - 1];
+        if (!(last && last.agent === normalized.agentId && last.text === text)) {
+          window.__openclaw_cc.meetingMessage({ agent: normalized.agentId, text, type, force: true });
+        }
+      }
+    }
     return true;
   }
 
@@ -4251,6 +4276,31 @@ function _handleOpenclawEventMessage(msg) {
     if (typing) typing.classList.remove('show');
     if (state.activeChat === normalized.agentId && state.activeView === 'chat') {
       renderChat();
+    }
+    // Mirror tagged agent events into briefing transcript too (some gateways emit "agent" instead of "chat.*").
+    if (
+      state.meeting?.active &&
+      normalized.from === 'agent' &&
+      Array.isArray(state.meeting.participants) &&
+      state.meeting.participants.includes(normalized.agentId)
+    ) {
+      const tag = state.meeting.tag ? `[${state.meeting.tag}]` : '';
+      const text = String(normalized.text || '');
+      if (!tag || text.includes(tag)) {
+        const stripped = tag ? text.replace(tag, '').trim() : text.trim();
+        const upper = stripped.toUpperCase();
+        const type = upper.startsWith('ACTION ITEM:') || upper.startsWith('ACTION:')
+          ? 'action-item'
+          : upper.startsWith('DECISION:')
+            ? 'decision'
+            : upper.startsWith('QUESTION:')
+              ? 'question'
+              : 'message';
+        const last = state.meeting.messages[state.meeting.messages.length - 1];
+        if (!(last && last.agent === normalized.agentId && last.text === text)) {
+          window.__openclaw_cc.meetingMessage({ agent: normalized.agentId, text, type, force: true });
+        }
+      }
     }
     return true;
   }
@@ -10259,6 +10309,7 @@ function renderAnalytics() {
 }
 
 // ── RENDER: Briefing Room ───────────────────────────
+let _briefingTranscriptRenderKey = '';
 function renderBriefing() {
   renderBriefingSeats();
   renderBriefingTranscript();
@@ -10305,6 +10356,32 @@ function renderBriefingTranscript() {
   const el = $('#br-transcript-scroll');
   if (!el) return;
 
+  // Always keep the duration display fresh (cheap), even if we skip re-rendering the transcript.
+  if (state.meeting.startedAt) {
+    const elapsed = Math.floor((Date.now() - state.meeting.startedAt) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    const next = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+    const durEl = $('#br-duration');
+    if (durEl && durEl.textContent !== next) durEl.textContent = next;
+  }
+
+  const msgLen = state.meeting.messages.length;
+  const last = msgLen ? state.meeting.messages[msgLen - 1] : null;
+  const renderKey = [
+    state.meeting.active ? '1' : '0',
+    state.meeting.topic || '',
+    String(msgLen),
+    String(last?.id || ''),
+    String(state.meeting.actionItems.length || 0),
+  ].join('|');
+
+  if (renderKey === _briefingTranscriptRenderKey) return;
+  _briefingTranscriptRenderKey = renderKey;
+
+  // Only auto-scroll when the user is already near the bottom.
+  const stayPinned = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 40);
+
   if (state.meeting.messages.length === 0) {
     el.innerHTML = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:12px;">
@@ -10314,6 +10391,7 @@ function renderBriefingTranscript() {
         </div>
       </div>
     `;
+    $('#br-msg-count').textContent = `0 messages`;
     return;
   }
 
@@ -10340,17 +10418,11 @@ function renderBriefingTranscript() {
       </div>
     `;
   }).join('');
-  el.scrollTop = el.scrollHeight;
+  if (stayPinned) el.scrollTop = el.scrollHeight;
 
   // Update counters
   const msgCount = state.meeting.messages.filter(m => m.type !== 'system').length;
   $('#br-msg-count').textContent = `${msgCount} message${msgCount!==1?'s':''}`;
-  if (state.meeting.startedAt) {
-    const elapsed = Math.floor((Date.now() - state.meeting.startedAt) / 1000);
-    const mins = Math.floor(elapsed / 60);
-    const secs = elapsed % 60;
-    $('#br-duration').textContent = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
-  }
 
   // Action items
   if (state.meeting.actionItems.length > 0) {
@@ -10504,21 +10576,31 @@ function startMeeting() {
     return;
   }
 
+  // Functional-only: require a live Gateway connection (no demo simulation).
+  if (!state.connected || !_isGatewayConnected()) {
+    $('#br-modal').classList.remove('open');
+    _showToast({ text: 'Connect to the Gateway before starting a briefing (demo simulation disabled).', level: 'error', ts: ts() });
+    return;
+  }
+
   $('#br-modal').classList.remove('open');
   $('#br-modal-topic').value = '';
 
   // Initialize meeting
+  const meetingTag = `BRIEFING-${Date.now().toString(36).toUpperCase()}`;
   state.meeting.active = true;
+  state.meeting.tag = meetingTag;
   state.meeting.topic = topic;
   state.meeting.messages = [];
   state.meeting.actionItems = [];
   state.meeting.startedAt = Date.now();
   state.meeting.participants = participants;
+  _briefingTranscriptRenderKey = '';
 
   // System message
   state.meeting.messages.push({
     id: Date.now(), agent: null, type: 'system',
-    text: `Briefing started — ${topic}`, ts: ts(),
+    text: `Briefing started — ${topic}  [${meetingTag}]`, ts: ts(),
   });
 
   renderBriefing();
@@ -10533,15 +10615,12 @@ function startMeeting() {
     }
   }, 1000);
 
-  // If connected to Gateway, send meeting start to lead agent
-  if (state.connected && state.ws) {
-    _sendGatewayChatMessage(participants[0], `Start a meeting about: ${topic}. Type: ${type}. Participants: ${participants.join(', ')}. Use agent-send to engage other agents. Push all responses to the Command Center via canvas.eval: window.__openclaw_cc.meetingMessage({agent:'YOUR_ID', text:'YOUR_MESSAGE'})`, { system: true });
-  }
-
-  // Demo mode: simulate the meeting
-  if (!state.connected) {
-    _simulateMeeting(topic, type, participants);
-  }
+  // Send meeting kickoff to every participant via normal chat.
+  // The transcript mirrors replies that include the meeting tag.
+  const kickoff = `[${meetingTag}] BRIEFING: ${topic} (${type})\n\nReply in this chat with updates prefixed by [${meetingTag}].\n\nFormat:\n- STATUS: what you shipped since last briefing\n- NOW: what you're doing next\n- BLOCKERS: risks/blockers\n- REQUESTS: who you need + what you need\n\nIf you create an action item, start the line with ACTION:. If you make a decision, start with DECISION:. If you have a question, start with QUESTION:.`;
+  participants.forEach((agentId) => {
+    _sendGatewayChatMessage(agentId, kickoff, { system: true });
+  });
 }
 
 function _simulateMeeting(topic, type, participants) {
