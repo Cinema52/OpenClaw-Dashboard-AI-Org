@@ -2956,8 +2956,8 @@ const OPENCLAW_DEVICE_AUTH_VERSION_V1 = 'v1';
 const OPENCLAW_DEVICE_AUTH_VERSION_V2 = 'v2';
 const OPENCLAW_CLIENT_ID = 'openclaw-control-ui';
 const OPENCLAW_CLIENT_MODE_KEY = 'oc_openclaw_client_mode';
-const OPENCLAW_CLIENT_MODE_CANDIDATES = ['operator', 'control-ui', 'control_ui', 'control', 'web'];
-let _openclawClientMode = 'operator';
+const OPENCLAW_CLIENT_MODE_CANDIDATES = ['ui', 'operator', 'control-ui', 'control_ui', 'control', 'web'];
+let _openclawClientMode = 'ui';
 const OPENCLAW_BOOTSTRAP_LOG_LIMIT = 60;
 const _openclawBootstrapLog = [];
 
@@ -3002,7 +3002,7 @@ function _readOpenclawClientModePreference() {
     const raw = (localStorage.getItem(OPENCLAW_CLIENT_MODE_KEY) || '').trim().toLowerCase();
     if (OPENCLAW_CLIENT_MODE_CANDIDATES.includes(raw)) return raw;
   } catch(e) {}
-  return 'operator';
+  return 'ui';
 }
 
 function _saveOpenclawClientModePreference(mode) {
@@ -3023,6 +3023,11 @@ function _isOpenclawClientModeError(err) {
 }
 
 _openclawClientMode = _readOpenclawClientModePreference();
+
+function _isOpenclawOriginBlockedError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return /origin not allowed|allowedorigins|allowed origins|controlui\.allowedorigins|controlui\.allowedorigins/.test(msg);
+}
 
 function _clearOpenclawRequests(reason = 'disconnect') {
   _openclawReqs.forEach((entry) => {
@@ -3905,7 +3910,8 @@ function _startOpenclawBootstrap() {
       state.connected = false;
       _openclawHelloAt = 0;
       const needsPairing = _openclawConnectErrorNeedsPairing(err);
-      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled && !needsPairing;
+      const originBlocked = _isOpenclawOriginBlockedError(err);
+      const fallback = (_gatewayProtocolPreference === 'auto' || _gatewayProtocolPreference === 'openclaw') && !_openclawFallbackScheduled && !needsPairing && !originBlocked;
       if (_openclawConnectSession === bootstrapSession) {
         _openclawPendingHelloApply = null;
       }
@@ -3923,7 +3929,19 @@ function _startOpenclawBootstrap() {
       } else {
         if (el) {
           el.className = 'disconnected';
-          el.title = needsPairing ? 'Gateway: pairing/auth required' : `Gateway: connect failed (${err.message})`;
+          if (originBlocked) {
+            el.title = 'Gateway: origin not allowed';
+          } else {
+            el.title = needsPairing ? 'Gateway: pairing/auth required' : `Gateway: connect failed (${err.message})`;
+          }
+        }
+        if (originBlocked) {
+          _showToast({
+            text: 'Gateway blocked this page origin. Host dashboard on gateway origin or add this origin in gateway.controlUi.allowedOrigins.',
+            level: 'error',
+            ts: ts(),
+          });
+          return;
         }
         const needsDeviceAuth = /invalid connect params|publickey|signature|device/.test(String(err?.message || '').toLowerCase());
         if (needsDeviceAuth) {
@@ -5853,6 +5871,11 @@ function connectGateway() {
         const reason = String(evt?.reason || '').toLowerCase();
         const code = evt?.code;
         const isPairingRequired = code === 1008 || reason.includes('pairing') || reason.includes('authorized') || reason.includes('not authorized') || reason.includes('invalid token');
+        const isOriginBlocked = reason.includes('origin not allowed') || reason.includes('allowedorigins') || reason.includes('allowed origins');
+        if (isOriginBlocked) {
+          el.title = `Gateway: origin not allowed${closeInfo}`;
+          return;
+        }
         const isRetryableTransportClose = !isPairingRequired && (code === 1006 || code === 1001 || code === 0);
         const nextAttemptIndex = attemptIndex + 1;
         if (isRetryableTransportClose && nextAttemptIndex < maxAttempts) {
