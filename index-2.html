@@ -2894,7 +2894,12 @@ let _gatewayNegotiationTimer = null;
 let _openclawConnectChallengeCount = 0;
 let _openclawConnectChallenge = null;
 let _openclawPendingHelloApply = null;
+let _openclawDeviceKeyPairCache = null;
 const OPENCLAW_DEVICE_ID_KEY = 'oc_openclaw_device_id';
+const OPENCLAW_DEVICE_KEYPAIR_KEY = 'oc_openclaw_device_keypair';
+const OPENCLAW_DEVICE_AUTH_VERSION = 'v1';
+const OPENCLAW_CLIENT_ID = 'openclaw-control-ui';
+const OPENCLAW_CLIENT_MODE = 'operator';
 const OPENCLAW_BOOTSTRAP_LOG_LIMIT = 60;
 const _openclawBootstrapLog = [];
 
@@ -2929,9 +2934,9 @@ function _setGatewayProtocolMode(mode) {
 }
 
 function _resolveConnectModeForCurrentState() {
-  const explicit = _gatewayProtocolPreference === 'auto' ? 'openclaw' : _gatewayProtocolPreference;
-  if (state && state.authToken && explicit === 'legacy') return 'openclaw';
-  return explicit;
+  if (_gatewayProtocolPreference === 'auto') return 'openclaw';
+  if (_gatewayProtocolPreference === 'openclaw') return 'openclaw';
+  return 'legacy';
 }
 
 function _clearOpenclawRequests(reason = 'disconnect') {
@@ -2947,6 +2952,90 @@ function _nextOpenclawReqId() {
   return `cc-${Date.now().toString(36)}-${_openclawReqSeq}`;
 }
 
+function _toBase64Url(bytes) {
+  const arr = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(arr.subarray(i, i + chunkSize)));
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function _safeJsonParse(value) {
+  if (!value) return null;
+  try { return JSON.parse(value); } catch(e) { return null; }
+}
+
+function _getOpenclawCrypto() {
+  try { return typeof crypto !== 'undefined' && crypto.subtle ? crypto.subtle : null; } catch(e) { return null; }
+}
+
+async function _ensureOpenclawDeviceKeyPair() {
+  if (_openclawDeviceKeyPairCache) return _openclawDeviceKeyPairCache;
+
+  const subtle = _getOpenclawCrypto();
+  if (!subtle || !subtle.generateKey || !subtle.importKey || !subtle.exportKey || !subtle.sign) {
+    return null;
+  }
+
+  try {
+    const storedRaw = localStorage.getItem(OPENCLAW_DEVICE_KEYPAIR_KEY);
+    const stored = _safeJsonParse(storedRaw);
+    if (stored?.privateKeyJwk && stored?.publicKeyJwk) {
+      try {
+        const publicKey = await subtle.importKey(
+          'jwk',
+          stored.publicKeyJwk,
+          { name: 'Ed25519' },
+          false,
+          ['verify']
+        );
+        const privateKey = await subtle.importKey(
+          'jwk',
+          stored.privateKeyJwk,
+          { name: 'Ed25519' },
+          false,
+          ['sign']
+        );
+        _openclawDeviceKeyPairCache = {
+          privateKey,
+          publicKey,
+          publicKeyString: stored.publicKey || stored.publicKeyJwk?.x || '',
+        };
+        return _openclawDeviceKeyPairCache;
+      } catch(e) {}
+    }
+  } catch(e) {}
+
+  try {
+    const generated = await subtle.generateKey(
+      { name: 'Ed25519' },
+      false,
+      ['sign', 'verify']
+    );
+    const publicKey = generated.publicKey;
+    const privateKey = generated.privateKey;
+    const publicKeyJwk = await subtle.exportKey('jwk', publicKey);
+    const privateKeyJwk = await subtle.exportKey('jwk', privateKey);
+    const record = {
+      publicKeyJwk,
+      privateKeyJwk,
+      publicKey: publicKeyJwk?.x || '',
+      createdAt: Date.now(),
+    };
+    try { localStorage.setItem(OPENCLAW_DEVICE_KEYPAIR_KEY, JSON.stringify(record)); } catch(e) {}
+    _openclawDeviceKeyPairCache = {
+      privateKey,
+      publicKey,
+      publicKeyString: record.publicKey,
+    };
+    return _openclawDeviceKeyPairCache;
+  } catch(e) {
+    return null;
+  }
+}
+
 function _getOpenclawClientInstanceId() {
   const storageKey = 'oc_openclaw_instance_id';
   try {
@@ -2960,6 +3049,38 @@ function _getOpenclawClientInstanceId() {
     return generated;
   } catch (e) {
     return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+}
+
+async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) {
+  const base = _getOpenclawDeviceIdentity(challengePayload);
+  const challengeData = _extractOpenclawPayload(challengePayload);
+  const challengeTs = Number(challengeData?.ts || challengeData?.timestamp || challengeData?.signedAt);
+  const signedAt = Number.isFinite(challengeTs) ? challengeTs : Date.now();
+  const token = _sanitizeBootstrapToken(authToken || '');
+  const nonce = _sanitizeBootstrapToken(challengeData?.nonce || challengeData?.nonceData || challengeData?.nonceStr || base?.nonce || '');
+  const scopeList = Array.isArray(scopes) ? scopes : [];
+  const challengePayloadText = `${OPENCLAW_DEVICE_AUTH_VERSION}|${base?.id || 'device'}|${OPENCLAW_CLIENT_ID}|${OPENCLAW_CLIENT_MODE}|operator|${scopeList.join(',')}|${signedAt}|${token}|${nonce}`;
+
+  const keyPair = await _ensureOpenclawDeviceKeyPair();
+  if (!keyPair?.privateKey || !keyPair?.publicKeyString) return null;
+
+  try {
+    const signatureBytes = await _getOpenclawCrypto().sign(
+      { name: 'Ed25519' },
+      keyPair.privateKey,
+      new TextEncoder().encode(challengePayloadText)
+    );
+    const result = {
+      id: base?.id || _getOpenclawDeviceIdentity()?.id,
+      publicKey: keyPair.publicKeyString,
+      signature: _toBase64Url(signatureBytes),
+      signedAt,
+    };
+    if (nonce) result.nonce = nonce;
+    return result;
+  } catch(e) {
+    return null;
   }
 }
 
@@ -3104,7 +3225,7 @@ function _handleOpenclawResponse(msg) {
   return true;
 }
 
-function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null) {
+async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challenge = null) {
   const challengeData = _extractOpenclawPayload(challenge || {});
   const auth = challengeData?.auth || {};
   const authPayload = {
@@ -3116,10 +3237,10 @@ function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challeng
     minProtocol: OPENCLAW_PROTOCOL_MIN,
     maxProtocol: OPENCLAW_PROTOCOL_MAX,
     client: {
-      id: 'openclaw-control-ui',
+      id: OPENCLAW_CLIENT_ID,
       version: '1.0.0',
       platform: 'web',
-      mode: 'ui',
+      mode: OPENCLAW_CLIENT_MODE,
     },
     role: 'operator',
     scopes,
@@ -3129,12 +3250,18 @@ function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, challeng
     locale: navigator.language || 'en-US',
     userAgent: `openclaw-control-ui (${navigator.userAgent || 'web'})`,
   };
-  payload.device = _getOpenclawDeviceIdentity(challengeData);
+  const signedDevice = await _buildOpenclawDevicePayload(challengeData, scopes, authPayload?.token || '');
+  if (signedDevice) {
+    payload.device = signedDevice;
+  } else if (state.authToken && window.isSecureContext === true) {
+    _recordOpenclawBootstrap({
+      level: 'warn',
+      area: 'openclaw.connect',
+      message: 'Device signing unavailable; attempting openclaw connect without device identity.',
+    });
+  }
 
   if (Object.keys(authPayload).length) payload.auth = authPayload;
-  if (challengeData?.nonce) payload.device.nonce = challengeData.nonce;
-  if (challengeData?.nonceStr) payload.device.nonce = payload.device.nonce || _sanitizeBootstrapToken(challengeData.nonceStr);
-  if (challengeData?.signedAt || challengeData?.ts) payload.device.signedAt = Number(challengeData.signedAt || challengeData.ts);
 
   return payload;
 }
@@ -3211,6 +3338,17 @@ function _normalizeOpenclawModelsPayload(payload) {
     .filter(Boolean);
 
   return normalized;
+}
+
+function _connectOpenclawSession(scopes, challengePayload = null, timeoutMs = Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000), onSuccess) {
+  return _buildOpenclawConnectPayload(scopes, challengePayload)
+    .then((payload) => _sendOpenclawRequest('connect', payload, timeoutMs))
+    .then((payload) => {
+      if (typeof onSuccess === 'function') {
+        onSuccess(payload);
+      }
+      return payload;
+    });
 }
 
 function _startOpenclawBootstrap() {
@@ -3344,10 +3482,7 @@ function _startOpenclawBootstrap() {
 
   _openclawPendingHelloApply = applyOpenclawHello;
 
-  const sendConnect = (scopes, challengePayload = null) =>
-    _sendOpenclawRequest('connect', _buildOpenclawConnectPayload(scopes, challengePayload), connectTimeoutMs).then((payload) => {
-      applyOpenclawHello(payload);
-    });
+  const sendConnect = (scopes, challengePayload = null) => _connectOpenclawSession(scopes, challengePayload, connectTimeoutMs, applyOpenclawHello);
 
   const attemptConnect = (attempt = 0) =>
     sendConnect(scopeAttempts[Math.min(attempt, scopeAttempts.length - 1)])
@@ -3523,13 +3658,12 @@ function _handleOpenclawEventMessage(msg) {
       _openclawConnectChallengeCount = (_openclawConnectChallengeCount || 0) + 1;
       if (_openclawConnectChallengeCount <= 3 && state.ws && state.ws.readyState === WebSocket.OPEN) {
         _openclawConnectChallenge = _extractOpenclawPayload(data) || data;
-        _sendOpenclawRequest(
-          'connect',
-          _buildOpenclawConnectPayload(
+        const apply = () => typeof _openclawPendingHelloApply === 'function' ? _openclawPendingHelloApply : null;
+        _connectOpenclawSession(
             OPENCLAW_CONNECT_SCOPES,
-            _openclawConnectChallenge
-          ),
-          Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000)
+            _openclawConnectChallenge,
+            Math.max(OPENCLAW_CONNECT_TIMEOUT_MS, 6000),
+            apply()
         )
           .catch((err) => {
             console.debug('[CommandCenter] connect retry after challenge failed:', err.message);
