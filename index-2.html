@@ -3048,6 +3048,44 @@ function _getOpenclawCrypto() {
   try { return typeof crypto !== 'undefined' && crypto.subtle ? crypto.subtle : null; } catch(e) { return null; }
 }
 
+const OPENCLAW_ED25519_ALGS = [
+  { name: 'Ed25519' },
+  'Ed25519',
+];
+
+async function _openclawImportEd25519Key(subtle, jwk, usage) {
+  if (!subtle || !jwk) return null;
+  for (const alg of OPENCLAW_ED25519_ALGS) {
+    try {
+      return await subtle.importKey('jwk', jwk, alg, false, [usage]);
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function _openclawGenerateEd25519KeyPair(subtle) {
+  if (!subtle) return null;
+  for (const alg of OPENCLAW_ED25519_ALGS) {
+    try {
+      return await subtle.generateKey(alg, false, ['sign', 'verify']);
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function _openclawSignEd25519(subtle, privateKey, bytes) {
+  if (!subtle || !privateKey || !bytes) return null;
+  for (const alg of OPENCLAW_ED25519_ALGS) {
+    try {
+      return await subtle.sign(alg, privateKey, bytes);
+    } catch (e) {}
+  }
+  try {
+    return await subtle.sign(privateKey.algorithm || { name: 'Ed25519' }, privateKey, bytes);
+  } catch (e) {}
+  return null;
+}
+
 async function _ensureOpenclawDeviceKeyPair() {
   if (_openclawDeviceKeyPairCache) return _openclawDeviceKeyPairCache;
 
@@ -3061,24 +3099,13 @@ async function _ensureOpenclawDeviceKeyPair() {
     const stored = _safeJsonParse(storedRaw);
     if (stored?.privateKeyJwk && stored?.publicKeyJwk) {
       try {
-        const publicKey = await subtle.importKey(
-          'jwk',
-          stored.publicKeyJwk,
-          { name: 'Ed25519' },
-          false,
-          ['verify']
-        );
-        const privateKey = await subtle.importKey(
-          'jwk',
-          stored.privateKeyJwk,
-          { name: 'Ed25519' },
-          false,
-          ['sign']
-        );
+        const publicKey = await _openclawImportEd25519Key(subtle, stored.publicKeyJwk, 'verify');
+        const privateKey = await _openclawImportEd25519Key(subtle, stored.privateKeyJwk, 'sign');
+        if (!publicKey || !privateKey) throw new Error('key import failed');
         _openclawDeviceKeyPairCache = {
           privateKey,
           publicKey,
-          publicKeyString: stored.publicKey || stored.publicKeyJwk?.x || '',
+          publicKeyString: stored.publicKey || stored.publicKeyJwk?.x || stored.publicKeyRaw || '',
         };
         return _openclawDeviceKeyPairCache;
       } catch(e) {}
@@ -3086,26 +3113,31 @@ async function _ensureOpenclawDeviceKeyPair() {
   } catch(e) {}
 
   try {
-    const generated = await subtle.generateKey(
-      { name: 'Ed25519' },
-      false,
-      ['sign', 'verify']
-    );
+    const generated = await _openclawGenerateEd25519KeyPair(subtle);
+    if (!generated?.publicKey || !generated?.privateKey) throw new Error('key generation failed');
     const publicKey = generated.publicKey;
     const privateKey = generated.privateKey;
     const publicKeyJwk = await subtle.exportKey('jwk', publicKey);
     const privateKeyJwk = await subtle.exportKey('jwk', privateKey);
+    let publicKeyString = publicKeyJwk?.x || '';
+    if (!publicKeyString) {
+      try {
+        const raw = await subtle.exportKey('raw', publicKey);
+        publicKeyString = _toBase64Url(raw);
+      } catch(e) {}
+    }
     const record = {
       publicKeyJwk,
       privateKeyJwk,
-      publicKey: publicKeyJwk?.x || '',
+      publicKey: publicKeyString,
+      publicKeyRaw: publicKeyString,
       createdAt: Date.now(),
     };
     try { localStorage.setItem(OPENCLAW_DEVICE_KEYPAIR_KEY, JSON.stringify(record)); } catch(e) {}
     _openclawDeviceKeyPairCache = {
       privateKey,
       publicKey,
-      publicKeyString: record.publicKey,
+      publicKeyString,
     };
     return _openclawDeviceKeyPairCache;
   } catch(e) {
@@ -3146,11 +3178,8 @@ async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) 
   if (!keyPair?.privateKey || !keyPair?.publicKeyString) return null;
 
   try {
-    const signatureBytes = await _getOpenclawCrypto().sign(
-      { name: 'Ed25519' },
-      keyPair.privateKey,
-      new TextEncoder().encode(challengePayloadText)
-    );
+    const signatureBytes = await _openclawSignEd25519(_getOpenclawCrypto(), keyPair.privateKey, new TextEncoder().encode(challengePayloadText));
+    if (!signatureBytes) return null;
     const result = {
       id: base?.id || _getOpenclawDeviceIdentity()?.id,
       publicKey: keyPair.publicKeyString,
@@ -3166,7 +3195,7 @@ async function _buildOpenclawDevicePayload(challengePayload, scopes, authToken) 
 
 function _openclawConnectErrorNeedsPairing(err) {
   const msg = String(err?.message || err || '').toLowerCase();
-  return /pairing|device identity|device token|not authorized|unauthorized|invalid token|authorization|approval/.test(msg);
+  return /pairing|device identity|device token|not authorized|unauthorized|invalid token|authorization|approval|invalid connect params|publickey|signature/.test(msg);
 }
 
 function _getOpenclawDeviceIdentity(challenge = null) {
@@ -3517,13 +3546,13 @@ async function _buildOpenclawConnectPayload(scopes = OPENCLAW_CONNECT_SCOPES, ch
     userAgent: `openclaw-control-ui (${navigator.userAgent || 'web'})`,
   };
   const signedDevice = await _buildOpenclawDevicePayload(challengeData, scopes, authPayload?.token || '');
-  if (signedDevice) {
+  if (signedDevice?.id && signedDevice?.publicKey && signedDevice?.signature) {
     payload.device = signedDevice;
   } else if (state.authToken && window.isSecureContext === true) {
     _recordOpenclawBootstrap({
       level: 'warn',
       area: 'openclaw.connect',
-      message: 'Device signing unavailable; attempting openclaw connect without device identity.',
+      message: 'Device signing unavailable in this browser; gateway may reject connect when strict device auth is enabled.',
     });
   }
 
@@ -3854,6 +3883,15 @@ function _startOpenclawBootstrap() {
         if (el) {
           el.className = 'disconnected';
           el.title = needsPairing ? 'Gateway: pairing/auth required' : `Gateway: connect failed (${err.message})`;
+        }
+        const needsDeviceAuth = /invalid connect params|publickey|signature|device/.test(String(err?.message || '').toLowerCase());
+        if (needsDeviceAuth) {
+          _showToast({
+            text: 'Gateway requires device auth. Try Chrome/Edge, or enable control UI insecure auth on the gateway.',
+            level: 'error',
+            ts: ts(),
+          });
+          return;
         }
         if (needsPairing) {
           _showToast({
